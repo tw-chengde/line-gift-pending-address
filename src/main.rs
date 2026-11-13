@@ -7,6 +7,7 @@
 //!   MAIL_SENDER              --send 時必填。用來寄信的 Workspace 信箱（服務帳號以全網域委派代表它）。
 //!   MAIL_SUMMARY_TO          統整信收件人，可用逗號分隔多個；未設定時寄給 MAIL_SENDER 自己。
 //!   MAIL_FROM_NAME           寄件人顯示名稱（選填）。
+//!   MAIL_REPLY_TO            收件人按「回覆」時的收件地址（選填）；未設定時回到 MAIL_SENDER。
 //!   MAIL_SERVICE_ACCOUNT     已設好全網域委派的服務帳號；未設定時用執行環境的服務帳號。
 //!   REMINDER_DAYS            下單滿幾天要提醒，逗號分隔（預設 5,8）。
 //!   DEADLINE_DAYS            最後填寫地址日期 = 下單日 + 這個天數（預設 9）。
@@ -440,6 +441,7 @@ fn encoded_word(text: &str) -> String {
 fn mime_message(
     from_name: Option<&str>,
     from: &str,
+    reply_to: Option<&str>,
     to: &str,
     subject: &str,
     html: &str,
@@ -448,6 +450,7 @@ fn mime_message(
         Some(name) => format!("{} <{from}>", encoded_word(name)),
         None => from.to_string(),
     };
+    let reply_to = reply_to.map_or_else(String::new, |address| format!("Reply-To: {address}\r\n"));
     let body = STANDARD.encode(html);
     let body = body
         .as_bytes()
@@ -456,7 +459,7 @@ fn mime_message(
         .collect::<Vec<_>>()
         .join("\r\n");
     format!(
-        "From: {from}\r\nTo: {to}\r\nSubject: {}\r\nMIME-Version: 1.0\r\n\
+        "From: {from}\r\n{reply_to}To: {to}\r\nSubject: {}\r\nMIME-Version: 1.0\r\n\
          Content-Type: text/html; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{body}\r\n",
         encoded_word(subject)
     )
@@ -490,6 +493,7 @@ struct Mailer {
     client: Client,
     sender: String,
     from_name: Option<String>,
+    reply_to: Option<String>,
     summary_to: String,
     token: String,
 }
@@ -501,6 +505,10 @@ impl Mailer {
             var("MAIL_SENDER").ok_or("缺少 MAIL_SENDER 環境變數（用來寄信的 Workspace 信箱）。")?;
         if !valid_email(&sender) {
             return Err(format!("MAIL_SENDER {sender} 不是有效的 email。"));
+        }
+        let reply_to = var("MAIL_REPLY_TO");
+        if let Some(bad) = reply_to.as_deref().filter(|address| !valid_email(address)) {
+            return Err(format!("MAIL_REPLY_TO {bad} 不是有效的 email。"));
         }
         let summary_to = match var("MAIL_SUMMARY_TO") {
             None => sender.clone(),
@@ -576,13 +584,21 @@ impl Mailer {
             client,
             sender,
             from_name: var("MAIL_FROM_NAME"),
+            reply_to,
             summary_to,
             token,
         })
     }
 
     async fn send(&self, to: &str, subject: &str, html: &str) -> Result<(), String> {
-        let message = mime_message(self.from_name.as_deref(), &self.sender, to, subject, html);
+        let message = mime_message(
+            self.from_name.as_deref(),
+            &self.sender,
+            self.reply_to.as_deref(),
+            to,
+            subject,
+            html,
+        );
         google_json(
             self.client
                 .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
@@ -803,12 +819,7 @@ async fn run() -> Result<(), String> {
         token,
     };
 
-    let (from, to) = query_range(
-        arg("from"),
-        arg("to"),
-        arg("today"),
-        config.deadline_days,
-    );
+    let (from, to) = query_range(arg("from"), arg("to"), arg("today"), config.deadline_days);
     if from > to {
         fail("--from 不可晚於 --to。");
     }
@@ -1130,6 +1141,7 @@ mod tests {
         let message = mime_message(
             Some("小店"),
             "shop@example.com",
+            Some("reply@example.com"),
             "to@example.com",
             subject,
             &"好".repeat(200),
@@ -1137,6 +1149,10 @@ mod tests {
         assert!(message.lines().all(|line| line.len() <= 76), "{message}");
         let (headers, body) = message.split_once("\r\n\r\n").unwrap();
         assert!(headers.contains("To: to@example.com\r\n"));
+        assert!(headers.contains("Reply-To: reply@example.com\r\n"));
+        // 沒設定回覆地址時不該出現這個標頭。
+        let plain = mime_message(None, "shop@example.com", None, "to@example.com", "hi", "x");
+        assert!(!plain.contains("Reply-To"));
         let decoded = STANDARD.decode(body.replace("\r\n", "")).unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), "好".repeat(200));
         // 每段 encoded-word 解回來要能拼回原本的主旨。

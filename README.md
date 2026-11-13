@@ -35,6 +35,7 @@ cargo run --release -- --today=2026-11-13 --max=500
 | `MAIL_SENDER` | `--send` 時必填。用來寄信的 Workspace 信箱 |
 | `MAIL_SUMMARY_TO` | 統整信收件人，可用逗號分隔多個；未設定時寄給 `MAIL_SENDER` |
 | `MAIL_FROM_NAME` | 寄件人顯示名稱（選填） |
+| `MAIL_REPLY_TO` | 收件人按「回覆」時的收件地址（選填）；未設定時回到 `MAIL_SENDER` |
 | `MAIL_SERVICE_ACCOUNT` | 已設好全網域委派的服務帳號；未設定時用執行環境的服務帳號 |
 
 ## 不改程式就能調整的設定
@@ -173,6 +174,7 @@ Remove-Item "$env:TEMP\lg-token.txt"
 | --- | --- |
 | `MAIL_SENDER` | 必填 |
 | `MAIL_FROM_NAME` | 選填 |
+| `MAIL_REPLY_TO` | 選填 |
 | `MAIL_SUMMARY_TO` | 選填 |
 | `MAIL_SERVICE_ACCOUNT` | 寄信用的服務帳號和 Job 的執行身分不同時才需要 |
 
