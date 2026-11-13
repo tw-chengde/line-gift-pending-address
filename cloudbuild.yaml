@@ -29,7 +29,7 @@ steps:
       - --image=${_IMAGE}
       - --region=${_REGION}
       - --service-account=line-gift-pending-address-job@${PROJECT_ID}.iam.gserviceaccount.com
-      - --set-secrets=LINE_GIFT_GATEWAY_TOKEN=line-gift-gateway-token:latest
+      - --set-secrets=LINE_GIFT_GATEWAY_TOKEN=line-gift-gateway-token:latest,MAIL_OAUTH_CLIENT_SECRET=mail-oauth-client-secret:latest,MAIL_OAUTH_REFRESH_TOKEN=mail-oauth-refresh-token:latest
       - --args=--send
       # 一定要是 0：重試會讓已經寄出的信再寄一次。
       - --max-retries=0

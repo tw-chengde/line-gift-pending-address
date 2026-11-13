@@ -11,13 +11,15 @@
 - 程式不記錄寄過誰：**同一天執行兩次會寄兩次**；某天沒執行，那天該提醒的訂單會被跳過，可用 `--today=YYYY-MM-DD` 補寄。
 - 沒帶 `--send` 時不寄任何信，只在輸出的 `reminders` 預覽今天會寄給誰。
 
-## 本機執行（只能預覽，寄信要在 Cloud Run 上）
+## 本機執行
 
 ```powershell
 $env:LINE_GIFT_GATEWAY_TOKEN = "..."
 cargo run --release
 cargo run --release -- --today=2026-11-13 --max=500
 ```
+
+沒帶 `--send` 只會預覽。本機要真的寄信，需另外設好 `MAIL_SENDER` 和三個 `MAIL_OAUTH_*` 環境變數。
 
 | 參數 | 說明 |
 | --- | --- |
@@ -32,11 +34,13 @@ cargo run --release -- --today=2026-11-13 --max=500
 | --- | --- |
 | `LINE_GIFT_GATEWAY_TOKEN` | 必填 |
 | `LINE_GIFT_ENVIRONMENT` | 設為 `beta` 改打測試環境 |
-| `MAIL_SENDER` | `--send` 時必填。用來寄信的 Workspace 信箱 |
+| `MAIL_SENDER` | `--send` 時必填。用來寄信的 Gmail 信箱，必須是授權時登入的那個帳號 |
+| `MAIL_OAUTH_CLIENT_ID` | `--send` 時必填。OAuth 用戶端 ID |
+| `MAIL_OAUTH_CLIENT_SECRET` | `--send` 時必填。OAuth 用戶端密鑰（Cloud Run 上來自 Secret Manager） |
+| `MAIL_OAUTH_REFRESH_TOKEN` | `--send` 時必填。更新權杖（Cloud Run 上來自 Secret Manager） |
 | `MAIL_SUMMARY_TO` | 統整信收件人，可用逗號分隔多個；未設定時寄給 `MAIL_SENDER` |
 | `MAIL_FROM_NAME` | 寄件人顯示名稱（選填） |
 | `MAIL_REPLY_TO` | 收件人按「回覆」時的收件地址（選填）；未設定時回到 `MAIL_SENDER` |
-| `MAIL_SERVICE_ACCOUNT` | 已設好全網域委派的服務帳號；未設定時用執行環境的服務帳號 |
 
 ## 不改程式就能調整的設定
 
@@ -77,40 +81,71 @@ MAIL_BODY=您贈送給朋友的 <strong>{products}</strong>，<br><span style="c
 
 ## 寄信的運作方式
 
-用 GCP 服務帳號的「全網域委派」代表 `MAIL_SENDER` 呼叫 Gmail API，不需要密碼或金鑰檔：
-服務帳號呼叫 IAM `signJwt` 幫自己簽一張 JWT，再向 Google 換成只有 `gmail.send` 權限的權杖。
-GCP 專案和 Workspace 不必屬於同一個帳號或機構。
+用個人 Gmail 帳號（`MAIL_SENDER`）寄信。個人帳號沒有「全網域委派」可用，所以改由帳號本人做一次 OAuth 授權，
+拿到只有 `gmail.send`（只能寄信、不能讀信）權限的更新權杖，存在 Secret Manager；
+Job 每次執行時用它向 Google 換一張短效權杖，再呼叫 Gmail API。
+
+- 個人 Gmail 每天約可寄給 500 位收件人，超過會被暫時停寄。
+- **更改 Google 帳號密碼會讓更新權杖失效**（Job 會以 `invalid_grant` 失敗），需重做下方第 3、4 步。
+  在 [Google 帳戶的第三方存取權](https://myaccount.google.com/connections)移除這個應用程式、或權杖連續 6 個月沒用到，也會失效。
 
 ### 一次性設定
+
+#### 1. 啟用 Gmail API、設定 OAuth 同意畫面
+
+GCP 主控台（專案可以屬於任何帳號，不必是寄信的那個 Gmail）：
+
+1. 「API 和服務」→「程式庫」→ 啟用 **Gmail API**。
+2. 「API 和服務」→「OAuth 同意畫面」（Google Auth Platform）：使用者類型選**外部**，填應用程式名稱與聯絡 email。
+3. 「目標對象」→ 把發布狀態按成**正式版**（In production）。
+   **留在「測試中」的話，更新權杖 7 天就會過期。** 不必送審；沒送審只是授權時多一個「Google 尚未驗證這個應用程式」的警告畫面。
+
+#### 2. 建立 OAuth 用戶端
+
+「API 和服務」→「憑證」→「建立憑證」→「OAuth 用戶端 ID」：
+
+- 應用程式類型：**網頁應用程式**
+- 已授權的重新導向 URI：`https://developers.google.com/oauthplayground`
+
+記下用戶端 ID 和用戶端密鑰。
+
+#### 3. 用寄信的 Gmail 帳號授權，取得更新權杖
+
+1. 開 [OAuth 2.0 Playground](https://developers.google.com/oauthplayground)，右上角齒輪 → 勾「Use your own OAuth credentials」，填入上一步的用戶端 ID 和密鑰。
+2. 左側 Step 1 最下方的輸入框填 `https://www.googleapis.com/auth/gmail.send` →「Authorize APIs」。
+3. 登入**要用來寄信的那個 Gmail 帳號**。出現未驗證警告時按「進階」→「前往…（不安全）」，再按允許。
+4. Step 2 按「Exchange authorization code for tokens」，複製 **Refresh token**。
+
+#### 4. 把密鑰放進 Secret Manager、建立 Job 的服務帳號
 
 ```powershell
 $project = "你的專案ID"
 $sa = "line-gift-pending-address-job@$project.iam.gserviceaccount.com"
 
-gcloud services enable gmail.googleapis.com iamcredentials.googleapis.com
-
 # Job 專用的服務帳號
 gcloud iam service-accounts create line-gift-pending-address-job --display-name="LINE gift pending address job"
 
-# 讓它能幫自己簽 JWT
-gcloud iam service-accounts add-iam-policy-binding $sa `
-  --member="serviceAccount:$sa" --role="roles/iam.serviceAccountTokenCreator"
+# 兩個寄信用的密鑰（名稱要和 cloudbuild.yaml 一致）
+Set-Content -Path "$env:TEMP\s.txt" -Value "用戶端密鑰" -NoNewline -Encoding ascii
+gcloud secrets create mail-oauth-client-secret --data-file="$env:TEMP\s.txt"
+Set-Content -Path "$env:TEMP\s.txt" -Value "更新權杖" -NoNewline -Encoding ascii
+gcloud secrets create mail-oauth-refresh-token --data-file="$env:TEMP\s.txt"
+Remove-Item "$env:TEMP\s.txt"
 
-# 讓它能讀 LINE token
-gcloud secrets add-iam-policy-binding line-gift-gateway-token `
-  --member="serviceAccount:$sa" --role="roles/secretmanager.secretAccessor"
-
-# 印出一串數字（用戶端 ID），下一步要用
-gcloud iam service-accounts describe $sa --format="value(uniqueId)"
+# 讓 Job 能讀三個密鑰（line-gift-gateway-token 見下方「LINE token 放 Secret Manager」）
+foreach ($secret in "line-gift-gateway-token", "mail-oauth-client-secret", "mail-oauth-refresh-token") {
+  gcloud secrets add-iam-policy-binding $secret `
+    --member="serviceAccount:$sa" --role="roles/secretmanager.secretAccessor"
+}
 ```
 
-接著請 **Workspace 超級管理員**到 [admin.google.com](https://admin.google.com)：
-「安全性」→「存取權與資料控管」→「API 控制項」→「管理全網域委派」→「新增」
+之後要換更新權杖（例如改過密碼），重做第 3 步後新增一個版本即可，不用重新部署：
 
-- 用戶端 ID：上面印出的那串數字
-- OAuth 範圍：`https://www.googleapis.com/auth/gmail.send`
-
-設定生效可能要等幾分鐘。這個授權讓服務帳號能以該網域內任何使用者的名義寄信，所以服務帳號請只給這個 Job 用。
+```powershell
+Set-Content -Path "$env:TEMP\s.txt" -Value "新的更新權杖" -NoNewline -Encoding ascii
+gcloud secrets versions add mail-oauth-refresh-token --data-file="$env:TEMP\s.txt"
+Remove-Item "$env:TEMP\s.txt"
+```
 
 ## 部署成 Cloud Run Job
 
@@ -133,7 +168,7 @@ gcloud secrets create line-gift-gateway-token --data-file="$env:TEMP\lg-token.tx
 Remove-Item "$env:TEMP\lg-token.txt"
 ```
 
-第一次 push 之前，這個密鑰和上面「一次性設定」的服務帳戶 `line-gift-pending-address-job`（含讀取密鑰的權限）都要先建好，否則部署那一步會失敗。
+第一次 push 之前，這個密鑰、上面「一次性設定」的兩個寄信密鑰，以及服務帳戶 `line-gift-pending-address-job`（含讀取三個密鑰的權限）都要先建好，否則部署那一步會失敗。
 
 ### 2. 設定 Cloud Build（只需一次）
 
@@ -172,13 +207,15 @@ Remove-Item "$env:TEMP\lg-token.txt"
 
 | 環境變數 | 是否必填 |
 | --- | --- |
-| `MAIL_SENDER` | 必填 |
+| `MAIL_SENDER` | 必填。授權時登入的那個 Gmail 信箱 |
+| `MAIL_OAUTH_CLIENT_ID` | 必填。OAuth 用戶端 ID（不是機密，直接填） |
 | `MAIL_FROM_NAME` | 選填 |
 | `MAIL_REPLY_TO` | 選填 |
 | `MAIL_SUMMARY_TO` | 選填 |
-| `MAIL_SERVICE_ACCOUNT` | 寄信用的服務帳號和 Job 的執行身分不同時才需要 |
 
-`MAIL_SENDER` 設定之前執行 Job 會直接失敗，不會寄出任何信，所以排程請等這一步完成後再建立。
+`MAIL_OAUTH_CLIENT_SECRET` 和 `MAIL_OAUTH_REFRESH_TOKEN` 由 `cloudbuild.yaml` 從 Secret Manager 帶入，不用在這裡填。
+
+`MAIL_SENDER` 和 `MAIL_OAUTH_CLIENT_ID` 設定之前執行 Job 會直接失敗，不會寄出任何信，所以排程請等這一步完成後再建立。
 
 ### 4. 執行
 

@@ -4,11 +4,13 @@
 //! 環境變數：
 //!   LINE_GIFT_GATEWAY_TOKEN  必填。
 //!   LINE_GIFT_ENVIRONMENT    設為 beta 時改打測試環境。
-//!   MAIL_SENDER              --send 時必填。用來寄信的 Workspace 信箱（服務帳號以全網域委派代表它）。
+//!   MAIL_SENDER              --send 時必填。用來寄信的 Gmail 信箱（就是授權時登入的那個帳號）。
+//!   MAIL_OAUTH_CLIENT_ID     --send 時必填。OAuth 用戶端 ID。
+//!   MAIL_OAUTH_CLIENT_SECRET --send 時必填。OAuth 用戶端密鑰。
+//!   MAIL_OAUTH_REFRESH_TOKEN --send 時必填。MAIL_SENDER 授權 gmail.send 後拿到的更新權杖。
 //!   MAIL_SUMMARY_TO          統整信收件人，可用逗號分隔多個；未設定時寄給 MAIL_SENDER 自己。
 //!   MAIL_FROM_NAME           寄件人顯示名稱（選填）。
 //!   MAIL_REPLY_TO            收件人按「回覆」時的收件地址（選填）；未設定時回到 MAIL_SENDER。
-//!   MAIL_SERVICE_ACCOUNT     已設好全網域委派的服務帳號；未設定時用執行環境的服務帳號。
 //!   REMINDER_DAYS            下單滿幾天要提醒，逗號分隔（預設 5,8）。
 //!   DEADLINE_DAYS            最後填寫地址日期 = 下單日 + 這個天數（預設 9）。
 //!   MAIL_SUBJECT / MAIL_BODY 提醒信的主旨與內文（HTML）範本，可用 {products} {deadline} 等代碼。
@@ -58,9 +60,6 @@ const PLACEHOLDERS: [&str; 7] = [
     "recipients",
     "order_id",
 ];
-const GMAIL_SEND_SCOPE: &str = "https://www.googleapis.com/auth/gmail.send";
-const METADATA: &str =
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default";
 
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
@@ -487,8 +486,7 @@ async fn google_json(request: RequestBuilder, what: &str) -> Result<Value, Strin
         .map_err(|error| format!("{what}回應不是 JSON: {error}"))
 }
 
-/// 以服務帳號的全網域委派代表 MAIL_SENDER，透過 Gmail API 寄信。
-/// 不使用金鑰檔：由執行環境的服務帳號呼叫 IAM signJwt 幫自己簽 JWT，再換成 Gmail 權杖。
+/// 以 MAIL_SENDER 本人授權的 OAuth 更新權杖（只有 gmail.send 權限）透過 Gmail API 寄信。
 struct Mailer {
     client: Client,
     sender: String,
@@ -502,7 +500,7 @@ impl Mailer {
     async fn connect(client: Client) -> Result<Self, String> {
         let var = env_text;
         let sender =
-            var("MAIL_SENDER").ok_or("缺少 MAIL_SENDER 環境變數（用來寄信的 Workspace 信箱）。")?;
+            var("MAIL_SENDER").ok_or("缺少 MAIL_SENDER 環境變數（用來寄信的 Gmail 信箱）。")?;
         if !valid_email(&sender) {
             return Err(format!("MAIL_SENDER {sender} 不是有效的 email。"));
         }
@@ -521,58 +519,20 @@ impl Mailer {
             }
         };
 
-        let platform_token = {
-            let request = client
-                .get(format!("{METADATA}/token"))
-                .header("Metadata-Flavor", "Google");
-            let token =
-                google_json(request, "取得服務帳號權杖（寄信只能在 Cloud Run 上執行）").await?;
-            text(&token["access_token"], "")
-        };
-        let service_account = match var("MAIL_SERVICE_ACCOUNT") {
-            Some(account) => account,
-            None => {
-                let request = client
-                    .get(format!("{METADATA}/email"))
-                    .header("Metadata-Flavor", "Google");
-                google_text(request, "取得服務帳號名稱")
-                    .await?
-                    .trim()
-                    .to_string()
-            }
-        };
-
-        let now = Utc::now().timestamp();
-        let claims = json!({
-            "iss": service_account,
-            "sub": sender,
-            "scope": GMAIL_SEND_SCOPE,
-            "aud": "https://oauth2.googleapis.com/token",
-            "iat": now,
-            "exp": now + 3600,
-        });
-        let signed = google_json(
-            client
-                .post(format!(
-                    "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:signJwt",
-                    encode_path_segment(&service_account)
-                ))
-                .bearer_auth(&platform_token)
-                .json(&json!({ "payload": claims.to_string() })),
-            "簽署 JWT（signJwt）",
-        )
-        .await?;
-        let jwt = signed["signedJwt"]
-            .as_str()
-            .ok_or("signJwt 回應缺少 signedJwt。")?;
+        let required = |key: &str| var(key).ok_or(format!("缺少 {key} 環境變數。"));
+        let client_id = required("MAIL_OAUTH_CLIENT_ID")?;
+        let client_secret = required("MAIL_OAUTH_CLIENT_SECRET")?;
+        let refresh_token = required("MAIL_OAUTH_REFRESH_TOKEN")?;
         let token = google_json(
             client
                 .post("https://oauth2.googleapis.com/token")
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body(format!(
-                    "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}"
-                )),
-            "換取 Gmail 權杖（請確認 Workspace 全網域委派設定）",
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", &client_id),
+                    ("client_secret", &client_secret),
+                    ("refresh_token", &refresh_token),
+                ]),
+            "換取 Gmail 權杖（invalid_grant 表示更新權杖已失效，需重新授權）",
         )
         .await?;
         let token = token["access_token"]
