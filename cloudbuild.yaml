@@ -1,0 +1,45 @@
+# push 到 GitHub main 分支時，由 Cloud Build 觸發條件自動執行：
+# 建置映像檔 → 推到 Artifact Registry → 建立或更新 Cloud Run Job
+substitutions:
+  _REGION: asia-east1
+  _JOB: line-gift-pending-address
+  # Artifact Registry 存放區和 Job 同名。
+  _IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_JOB}/${_JOB}:${SHORT_SHA}
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}", "."]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_IMAGE}"]
+
+  # Job 不存在就建立，存在就更新。只部署不執行，所以部署本身不會寄信。
+  # 環境變數（MAIL_SENDER、天數、信件範本等）不寫在這裡，在 Cloud Run 主控台設定，
+  # 每次部署都會保留。
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - ${_JOB}
+      - --image=${_IMAGE}
+      - --region=${_REGION}
+      - --service-account=line-gift-pending-address-job@${PROJECT_ID}.iam.gserviceaccount.com
+      - --set-secrets=LINE_GIFT_GATEWAY_TOKEN=line-gift-gateway-token:latest
+      - --args=--send
+      # 一定要是 0：重試會讓已經寄出的信再寄一次。
+      - --max-retries=0
+      - --task-timeout=10m
+
+# Rust 的 release 建置比較久，預設的 10 分鐘可能不夠。
+timeout: 1800s
+
+options:
+  # _IMAGE 由其他變數組成，需要開啟才會展開。
+  dynamic_substitutions: true
+  # 觸發條件使用自訂服務帳戶時，必須指定紀錄寫到哪裡。
+  logging: CLOUD_LOGGING_ONLY

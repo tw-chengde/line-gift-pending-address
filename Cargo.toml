@@ -1,0 +1,17 @@
+[package]
+name = "line-gift-pending-address"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# preserve_order：輸出欄位順序與 deliveryFormFields 依 LINE 回傳的原始順序。
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[profile.release]
+strip = true
+lto = true
