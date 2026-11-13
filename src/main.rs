@@ -13,7 +13,7 @@
 //!   MAIL_SUBJECT / MAIL_BODY 提醒信的主旨與內文（HTML）範本，可用 {products} {deadline} 等代碼。
 //!
 //! 參數：
-//!   --from / --to  台北時間的日期（YYYY-MM-DD），以訂單成立時間篩選；未指定時查最近 DEADLINE_DAYS + 1 天。
+//!   --from / --to  台北時間的日期（YYYY-MM-DD），以訂單成立時間篩選；未指定時查最近 DEADLINE_DAYS + 1 天（有帶 --today 時從那一天往回算）。
 //!   --max          最多檢查幾筆已付款訂單（預設 200；每筆需呼叫一次訂單詳情）。
 //!   --send         真的寄出提醒信與統整信；沒帶時只在輸出的 reminders 預覽，不寄任何信。
 //!   --today        把「今天」當成指定日期（YYYY-MM-DD）來算滿幾天，補寄漏掉的那一天時用。
@@ -747,6 +747,25 @@ fn summary_html(
     html
 }
 
+/// 訂單查詢範圍。沒指定 --to 時以 --today（補寄的那一天）為準，否則用現在；
+/// 這樣補寄幾天前的提醒時，當時該提醒的訂單仍在範圍內。
+fn query_range(
+    from: Option<&str>,
+    to: Option<&str>,
+    today: Option<&str>,
+    deadline_days: i64,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let to = to
+        .or(today)
+        .map_or_else(Utc::now, |value| taipei_day(value, true));
+    // 預設查詢範圍要涵蓋到最後填寫日期為止的訂單，多留一天給「今天」的時分秒。
+    let from = from.map_or_else(
+        || to - TimeDelta::days(deadline_days + 1),
+        |value| taipei_day(value, false),
+    );
+    (from, to)
+}
+
 async fn run() -> Result<(), String> {
     let args: HashMap<String, String> = env::args()
         .skip(1)
@@ -784,11 +803,11 @@ async fn run() -> Result<(), String> {
         token,
     };
 
-    let to = arg("to").map_or_else(Utc::now, |value| taipei_day(value, true));
-    // 預設查詢範圍要涵蓋到最後填寫日期為止的訂單，多留一天給「今天」的時分秒。
-    let from = arg("from").map_or_else(
-        || to - TimeDelta::days(config.deadline_days + 1),
-        |value| taipei_day(value, false),
+    let (from, to) = query_range(
+        arg("from"),
+        arg("to"),
+        arg("today"),
+        config.deadline_days,
     );
     if from > to {
         fail("--from 不可晚於 --to。");
@@ -1032,6 +1051,24 @@ mod tests {
             subject: DEFAULT_MAIL_SUBJECT.to_string(),
             body: DEFAULT_MAIL_BODY.to_string(),
         }
+    }
+
+    #[test]
+    fn query_range_follows_today_when_backfilling() {
+        // 補寄 11/10：滿 8 天的 11/2 訂單、最後填寫日當天的 11/1 訂單都要查得到。
+        let (from, to) = query_range(None, None, Some("2026-11-10"), DEFAULT_DEADLINE_DAYS);
+        assert_eq!(to, taipei_day("2026-11-10", true));
+        assert!(from < taipei_day("2026-11-01", false));
+
+        // 明確指定的 --from / --to 不受 --today 影響。
+        let (from, to) = query_range(
+            Some("2026-11-05"),
+            Some("2026-11-12"),
+            Some("2026-11-10"),
+            DEFAULT_DEADLINE_DAYS,
+        );
+        assert_eq!(from, taipei_day("2026-11-05", false));
+        assert_eq!(to, taipei_day("2026-11-12", true));
     }
 
     #[test]
