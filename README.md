@@ -93,6 +93,8 @@ gcloud projects add-iam-policy-binding 你的專案ID `
 - 預覽（沒帶 `--send`）時也會寫入對照表。
 - 只設 `SHORT_NAMES_BUCKET`、不設 `GEMINI_MODEL` 也可以：這時只查表，表完全由你手動維護。
 - 表讀不到或格式壞掉時，這次全部用原名而且不會寫回，既有的表不會被蓋掉。
+- Job 執行期間（讀表之後、寫回之前）表被改動時，Job 不會覆蓋你的修改：這次新加的項目不寫回，
+  原因記在 `reminders.shortNameError` 與統整信，信照寄，下次執行會重新濃縮那些商品。
 
 ```powershell
 gcloud storage buckets create gs://你的bucket名稱 --location=asia-east1 --uniform-bucket-level-access
@@ -127,6 +129,9 @@ push 觸發的自動部署不會動到環境變數，不會蓋掉這些值。
 | `{sender_name}` | 送禮人（發票姓名） | |
 | `{recipients}` | 收禮人 | |
 | `{order_id}` | 訂單編號 | |
+
+內文裡的代碼可以放在文字或**有引號**（單、雙引號皆可）的屬性值內。換進去的內容只做 HTML 跳脫，
+保證不會跳出文字或引號；不要放在沒有引號的屬性，或 `href`、`style`、`<script>` 這類需要網址／CSS／程式語意的位置。
 
 預設值：
 

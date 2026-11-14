@@ -35,6 +35,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    future::Future,
     process::exit,
     time::Duration,
 };
@@ -292,23 +293,78 @@ impl Api {
                 response.status().as_u16()
             ));
         }
-        let mut envelope: Value = response
+        let envelope: Value = response
             .json()
             .await
             .map_err(|error| format!("LINE Gift 回應不是 JSON ({path}): {error}"))?;
-        if envelope["success"] != true {
-            let error = match &envelope["errors"][0] {
-                Value::Null => &envelope["error"],
-                first => first,
-            };
-            return Err(format!(
-                "LINE Gift API 失敗 ({path}): {} {}",
-                text(&error["code"], "UNKNOWN"),
-                text(&error["message"], "")
-            ));
-        }
-        Ok(envelope["result"].take())
+        envelope_result(path, envelope)
     }
+}
+
+/// 從 LINE 的回應外層取出 result。success 為 true 卻沒有 result 物件時算失敗：
+/// 清單與詳情都把 result 當物件讀，少了它會被誤判成「沒有待處理的訂單」。
+fn envelope_result(path: &str, mut envelope: Value) -> Result<Value, String> {
+    if envelope["success"] != true {
+        let error = match &envelope["errors"][0] {
+            Value::Null => &envelope["error"],
+            first => first,
+        };
+        return Err(format!(
+            "LINE Gift API 失敗 ({path}): {} {}",
+            text(&error["code"], "UNKNOWN"),
+            text(&error["message"], "")
+        ));
+    }
+    if !envelope["result"].is_object() {
+        return Err(format!("LINE Gift 回應缺少 result 物件 ({path})。"));
+    }
+    Ok(envelope["result"].take())
+}
+
+/// 訂單清單某一頁（page 從 0 起算）的 (已付款訂單總數, 這一頁的訂單編號)。
+/// 依總數這一頁應該有資料卻沒有 list，或有訂單沒有編號，都算回應格式錯誤，
+/// 不當成「查完了」；總數為 0 時省略 list 則是正常的空清單。
+fn order_page(result: &Value, page: usize) -> Result<(usize, Vec<String>), String> {
+    let total = result["paginate"]["totalCount"]
+        .as_u64()
+        .ok_or("LINE Gift 訂單清單缺少 paginate.totalCount。")? as usize;
+    let list = match &result["list"] {
+        Value::Array(list) => list.as_slice(),
+        Value::Null if page.saturating_mul(PAGE_SIZE) >= total => &[],
+        Value::Null => {
+            return Err(format!(
+                "LINE Gift 訂單清單第 {} 頁缺少 list（共 {total} 筆）。",
+                page + 1
+            ))
+        }
+        _ => return Err("LINE Gift 訂單清單的 list 不是陣列。".to_string()),
+    };
+    let ids = list
+        .iter()
+        .map(|summary| match &summary["id"] {
+            Value::String(id) if !id.is_empty() => Ok(id.clone()),
+            Value::Null | Value::String(_) => {
+                Err("LINE Gift 訂單清單內有訂單缺少 id。".to_string())
+            }
+            id => Ok(id.to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((total, ids))
+}
+
+/// 訂單詳情裡判斷「哪些已付款品項還沒填地址」一定要有的形狀。
+/// 訂單是因為有 PAYED 品項才被查到的，沒有 items 就無從判斷，不能當成沒有待處理品項。
+/// deliveryGroups 省略或 null 視為沒有配送群組；deliveryForm 為 null 則是尚未填寫，都不算錯。
+fn check_order_detail(id: &str, detail: &Value) -> Result<(), String> {
+    if !detail["items"].is_array() {
+        return Err(format!("LINE Gift 訂單 {id} 的詳情缺少 items 陣列。"));
+    }
+    if !matches!(detail["deliveryGroups"], Value::Null | Value::Array(_)) {
+        return Err(format!(
+            "LINE Gift 訂單 {id} 的詳情 deliveryGroups 不是陣列。"
+        ));
+    }
+    Ok(())
 }
 
 fn has_text(value: &Value) -> bool {
@@ -368,7 +424,8 @@ fn ordered_date(value: &Value) -> Option<NaiveDate> {
         Value::Number(number) => {
             let number = number.as_i64()?;
             let millis = if number < 100_000_000_000 {
-                number * 1000
+                // 來自訂單資料，離譜的數值不能讓乘法溢位。
+                number.checked_mul(1000)?
             } else {
                 number
             };
@@ -377,6 +434,11 @@ fn ordered_date(value: &Value) -> Option<NaiveDate> {
         _ => return None,
     };
     Some(utc.with_timezone(&taipei()).date_naive())
+}
+
+/// 最後填寫地址日期 = 下單日 + deadline_days；天數大到日期算不出來時為 None。
+fn deadline_date(ordered: NaiveDate, deadline_days: i64) -> Option<NaiveDate> {
+    ordered.checked_add_signed(TimeDelta::try_days(deadline_days)?)
 }
 
 /// 例如 11/21（六）。
@@ -422,11 +484,13 @@ fn product_text(groups: &[Value], short_names: &BTreeMap<String, ShortName>) -> 
         .join("、")
 }
 
+/// 跳脫後的內容可以放在 HTML 文字或有引號（單、雙皆可）的屬性值裡。& 要最先處理。
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// 收件地址來自送禮人自己填的發票 email，會直接放進信件標頭，所以只接受單純的 ASCII 地址。
@@ -577,38 +641,86 @@ async fn gcp_token(client: &Client) -> Result<String, String> {
 /// 對照表在 bucket 裡的物件名稱，格式見 parse_short_names。
 const SHORT_NAMES_OBJECT: &str = "short-names.json";
 
-/// 讀 Cloud Storage 上的對照表；物件還不存在時是空表。
-async fn load_short_names(
-    client: &Client,
-    token: &str,
-    bucket: &str,
-) -> Result<BTreeMap<String, ShortName>, String> {
-    let response = client
-        .get(format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{SHORT_NAMES_OBJECT}?alt=media",
-            encode_path_segment(bucket)
-        ))
-        .bearer_auth(token)
+const STORAGE_ENDPOINT: &str = "https://storage.googleapis.com";
+
+/// 送出一個 Cloud Storage 請求，回傳 (HTTP 狀態, 內文)；錯誤只在連不上或讀不到回應時發生。
+/// 對照表的讀寫（*_with）把「怎麼送」當成參數，測試才能不開 socket 就檢查送出的請求與順序。
+async fn storage_send(request: RequestBuilder) -> Result<(StatusCode, String), String> {
+    let response = request
         .send()
         .await
-        .map_err(|error| format!("讀取商品名稱對照表連線失敗: {error}"))?;
+        .map_err(|error| format!("連線失敗: {error}"))?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|error| format!("讀取商品名稱對照表失敗: {error}"))?;
+        .map_err(|error| format!("讀取回應失敗: {error}"))?;
+    Ok((status, body))
+}
+
+async fn load_short_names(
+    client: &Client,
+    token: &str,
+    bucket: &str,
+) -> Result<(BTreeMap<String, ShortName>, u64), String> {
+    load_short_names_with(storage_send, client, token, bucket).await
+}
+
+/// 讀 Cloud Storage 上的對照表，回傳 (表, 讀到的那一版的 generation)。
+/// 先問 metadata 拿 generation，再指定那個 generation 讀內容，內容和版本才對得起來；
+/// 寫回時以這個 generation 為條件（見 save_short_names_with）。物件還不存在時是空表、generation 0。
+async fn load_short_names_with<Send, Sent>(
+    send: Send,
+    client: &Client,
+    token: &str,
+    bucket: &str,
+) -> Result<(BTreeMap<String, ShortName>, u64), String>
+where
+    Send: Fn(RequestBuilder) -> Sent,
+    Sent: Future<Output = Result<(StatusCode, String), String>>,
+{
+    let object = format!(
+        "{STORAGE_ENDPOINT}/storage/v1/b/{}/o/{SHORT_NAMES_OBJECT}",
+        encode_path_segment(bucket)
+    );
+    let failed = |status: StatusCode, body: &str| {
+        let detail: String = body.chars().take(300).collect();
+        format!("讀取商品名稱對照表失敗 HTTP {}: {detail}", status.as_u16())
+    };
+    let get = |url: String| {
+        let sent = send(client.get(url).bearer_auth(token));
+        async move {
+            sent.await
+                .map_err(|error| format!("讀取商品名稱對照表{error}"))
+        }
+    };
+    let (status, body) = get(format!("{object}?fields=generation")).await?;
     // bucket 不存在也是 404，那種情況之後寫回時會失敗並回報。
     if status == StatusCode::NOT_FOUND {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), 0));
     }
     if !status.is_success() {
-        let detail: String = body.chars().take(300).collect();
-        return Err(format!(
-            "讀取商品名稱對照表失敗 HTTP {}: {detail}",
-            status.as_u16()
-        ));
+        return Err(failed(status, &body));
     }
-    parse_short_names(&body)
+    // JSON API 的 int64 是以十進位數字字串表示。
+    let generation = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|metadata| {
+            let generation = metadata["generation"].as_str()?;
+            if !generation.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            generation.parse::<u64>().ok()
+        })
+        .ok_or("讀取商品名稱對照表失敗：metadata 回應沒有可用的 generation。")?;
+    let (status, body) = get(format!("{object}?alt=media&generation={generation}")).await?;
+    if status == StatusCode::NOT_FOUND {
+        return Err("讀取商品名稱對照表失敗：讀取途中檔案被改動或刪除。".to_string());
+    }
+    if !status.is_success() {
+        return Err(failed(status, &body));
+    }
+    Ok((parse_short_names(&body)?, generation))
 }
 
 /// 對照表檔案的格式：{"商品編號": {"name": "加入時的原始名稱", "short": "信裡要用的名稱"}}。
@@ -635,25 +747,54 @@ async fn save_short_names(
     token: &str,
     bucket: &str,
     table: &BTreeMap<String, ShortName>,
+    generation: u64,
 ) -> Result<(), String> {
+    save_short_names_with(storage_send, client, token, bucket, table, generation).await
+}
+
+/// 把整份表寫回去，條件是物件仍是讀到的那一版（generation 0 表示當時還不存在，只允許新建）。
+/// 期間被別人改過（HTTP 412）就放棄，不重讀、不合併、不重試，手動改的內容不會被蓋掉。
+async fn save_short_names_with<Send, Sent>(
+    send: Send,
+    client: &Client,
+    token: &str,
+    bucket: &str,
+    table: &BTreeMap<String, ShortName>,
+    generation: u64,
+) -> Result<(), String>
+where
+    Send: Fn(RequestBuilder) -> Sent,
+    Sent: Future<Output = Result<(StatusCode, String), String>>,
+{
     let entries: BTreeMap<&String, Value> = table
         .iter()
         .map(|(key, entry)| (key, entry.json()))
         .collect();
     let body = serde_json::to_string_pretty(&entries).map_err(|error| error.to_string())?;
-    google_text(
-        client
-            .post(format!(
-                "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={SHORT_NAMES_OBJECT}",
-                encode_path_segment(bucket)
-            ))
-            .bearer_auth(token)
-            .header("Content-Type", "application/json; charset=utf-8")
-            .body(body),
-        "寫入商品名稱對照表",
-    )
-    .await
-    .map(|_| ())
+    let request = client
+        .post(format!(
+            "{STORAGE_ENDPOINT}/upload/storage/v1/b/{}/o?uploadType=media&name={SHORT_NAMES_OBJECT}&ifGenerationMatch={generation}",
+            encode_path_segment(bucket)
+        ))
+        .bearer_auth(token)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(body);
+    let (status, body) = send(request)
+        .await
+        .map_err(|error| format!("寫入商品名稱對照表{error}"))?;
+    if status == StatusCode::PRECONDITION_FAILED {
+        return Err(format!(
+            "商品名稱對照表 {SHORT_NAMES_OBJECT} 在這次執行期間被改過，這次新增的項目沒有寫回，下次執行會重新濃縮。"
+        ));
+    }
+    if !status.is_success() {
+        let detail: String = body.chars().take(300).collect();
+        return Err(format!(
+            "寫入商品名稱對照表失敗 HTTP {}: {detail}",
+            status.as_u16()
+        ));
+    }
+    Ok(())
 }
 
 /// 一個商品的原始名稱（name）和信裡要用的名稱（short）。
@@ -680,14 +821,40 @@ fn short_names_json(entries: &BTreeMap<String, ShortName>) -> Value {
 /// 這次執行的商品名稱濃縮結果，鍵都是 product_key。
 #[derive(Default)]
 struct ShortNames {
-    /// 信裡實際換掉名稱的商品（name 是訂單上現在的名稱）。
+    /// 組信時套用的表：對照表（含這次新加的）裡 short 不是空白的全部項目。
+    /// 和 used 分開，才不會因為某筆訂單的名稱剛好等於 short，讓同商品的其他訂單套不到。
+    table: BTreeMap<String, ShortName>,
+    /// 信裡實際換掉名稱的商品（name 是訂單上現在的名稱），只用在報表。
     used: BTreeMap<String, ShortName>,
     /// 這次新加進對照表的商品（沒變短的 short 會和 name 一樣）。
     added: BTreeMap<String, ShortName>,
     error: Option<String>,
 }
 
-/// products 是今天要提醒的商品（鍵、訂單上的名稱）。對照表裡 short 和現在的名稱不同的才算有換名稱。
+/// 對照表裡可以套用的項目：short 去掉頭尾空白後不是空的。
+fn applied_short_names(table: &BTreeMap<String, ShortName>) -> BTreeMap<String, ShortName> {
+    table
+        .iter()
+        .filter_map(|(key, entry)| {
+            let short = entry.short.trim().to_string();
+            let name = entry.name.clone();
+            (!short.is_empty()).then(|| (key.clone(), ShortName { name, short }))
+        })
+        .collect()
+}
+
+/// 同一個商品出現在多筆訂單時只留一個名稱（最後出現的），問 Gemini 時每個商品只問一次。
+fn unique_products(products: &[(String, String)]) -> Vec<(String, String)> {
+    products
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect()
+}
+
+/// products 是今天要提醒的商品（鍵、訂單上的名稱），同一個商品在每筆訂單各列一次。
+/// 對照表裡 short 和訂單上的名稱不同的才算有換名稱；同商品只要有一筆不同就列入。
 fn used_short_names(
     products: &[(String, String)],
     table: &BTreeMap<String, ShortName>,
@@ -704,6 +871,7 @@ fn used_short_names(
 
 /// 先查對照表（有設 bucket 時），表裡沒有的才問 Gemini（有設 model 時），問到的結果寫回對照表。
 /// 對照表讀不到時整批用原名而且不寫回，避免把既有的表蓋掉。
+/// products 是未去重的清單（見 used_short_names）。
 async fn resolve_short_names(
     client: &Client,
     model: Option<&str>,
@@ -719,17 +887,18 @@ async fn resolve_short_names(
         }
     };
     let mut table = BTreeMap::new();
+    let mut generation = 0;
     if let Some(bucket) = bucket {
         match load_short_names(client, &token, bucket).await {
-            Ok(loaded) => table = loaded,
+            Ok(loaded) => (table, generation) = loaded,
             Err(error) => {
                 result.error = Some(error);
                 return result;
             }
         }
     }
-    let unknown: Vec<&(String, String)> = products
-        .iter()
+    let unknown: Vec<(String, String)> = unique_products(products)
+        .into_iter()
         .filter(|(key, _)| !table.contains_key(key))
         .collect();
     if let (Some(model), false) = (model, unknown.is_empty()) {
@@ -739,19 +908,23 @@ async fn resolve_short_names(
             Ok(short) => {
                 for (key, name) in unknown {
                     let entry = ShortName {
-                        name: name.clone(),
-                        short: short.get(name).unwrap_or(name).clone(),
+                        short: short.get(&name).unwrap_or(&name).clone(),
+                        name,
                     };
                     table.insert(key.clone(), entry.clone());
-                    result.added.insert(key.clone(), entry);
+                    result.added.insert(key, entry);
                 }
                 if let Some(bucket) = bucket {
-                    result.error = save_short_names(client, &token, bucket, &table).await.err();
+                    // 寫回失敗（含期間被別人改過）只記錄原因，這次仍用上面的結果組信。
+                    result.error = save_short_names(client, &token, bucket, &table, generation)
+                        .await
+                        .err();
                 }
             }
         }
     }
     result.used = used_short_names(products, &table);
+    result.table = applied_short_names(&table);
     result
 }
 
@@ -1062,16 +1235,20 @@ fn query_range(
     to: Option<&str>,
     today: Option<&str>,
     deadline_days: i64,
-) -> (DateTime<Utc>, DateTime<Utc>) {
+) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
     let to = to
         .or(today)
         .map_or_else(Utc::now, |value| taipei_day(value, true));
-    // 預設查詢範圍要涵蓋到最後填寫日期為止的訂單，多留一天給「今天」的時分秒。
-    let from = from.map_or_else(
-        || to - TimeDelta::days(deadline_days + 1),
-        |value| taipei_day(value, false),
-    );
-    (from, to)
+    let from = match from {
+        Some(value) => taipei_day(value, false),
+        // 預設查詢範圍要涵蓋到最後填寫日期為止的訂單，多留一天給「今天」的時分秒。
+        None => deadline_days
+            .checked_add(1)
+            .and_then(TimeDelta::try_days)
+            .and_then(|span| to.checked_sub_signed(span))
+            .ok_or_else(|| format!("DEADLINE_DAYS（{deadline_days}）太大，算不出查詢範圍。"))?,
+    };
+    Ok((from, to))
 }
 
 async fn run() -> Result<(), String> {
@@ -1111,7 +1288,7 @@ async fn run() -> Result<(), String> {
         token,
     };
 
-    let (from, to) = query_range(arg("from"), arg("to"), arg("today"), config.deadline_days);
+    let (from, to) = query_range(arg("from"), arg("to"), arg("today"), config.deadline_days)?;
     if from > to {
         fail("--from 不可晚於 --to。");
     }
@@ -1124,6 +1301,14 @@ async fn run() -> Result<(), String> {
         .map_or_else(Utc::now, |value| taipei_day(value, false))
         .with_timezone(&taipei())
         .date_naive();
+    // 下單日不會晚於今天，所以今天算得出最後填寫日期，每筆訂單就都算得出來。
+    let deadline_overflow = || {
+        format!(
+            "DEADLINE_DAYS（{}）太大，算不出最後填寫地址日期。",
+            config.deadline_days
+        )
+    };
+    deadline_date(today, config.deadline_days).ok_or_else(deadline_overflow)?;
 
     let mut ids: Vec<String> = Vec::new();
     let mut total_paid_orders = 0;
@@ -1135,16 +1320,11 @@ async fn run() -> Result<(), String> {
             "paging": { "page": page, "size": PAGE_SIZE },
             "sort": "ORDERED_AT_DESC",
         }))).await?;
-        total_paid_orders = result["paginate"]["totalCount"]
-            .as_u64()
-            .ok_or("LINE Gift 訂單清單缺少 paginate.totalCount。")?
-            as usize;
-        let list = result["list"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        ids.extend(list.iter().map(|summary| text(&summary["id"], "")));
-        if list.is_empty() || (page + 1) * PAGE_SIZE >= total_paid_orders {
+        let (total, page_ids) = order_page(&result, page)?;
+        total_paid_orders = total;
+        let last_page = page_ids.is_empty() || (page + 1) * PAGE_SIZE >= total_paid_orders;
+        ids.extend(page_ids);
+        if last_page {
             break;
         }
         page += 1;
@@ -1164,7 +1344,8 @@ async fn run() -> Result<(), String> {
             .await
         }))
         .await?;
-        for detail in details {
+        for (id, detail) in batch.iter().zip(details) {
+            check_order_detail(id, &detail)?;
             let groups = pending_groups(&detail, flag("raw"));
             if !groups.is_empty() {
                 match ordered_date(&detail["orderedAt"]) {
@@ -1186,7 +1367,8 @@ async fn run() -> Result<(), String> {
                                 order_id: text(&detail["id"], ""),
                                 ordered,
                                 days,
-                                deadline: ordered + TimeDelta::days(config.deadline_days),
+                                deadline: deadline_date(ordered, config.deadline_days)
+                                    .ok_or_else(deadline_overflow)?,
                                 sender_name: text(&detail["invoice"]["form"]["name"], ""),
                                 email,
                                 recipients: groups
@@ -1222,15 +1404,14 @@ async fn run() -> Result<(), String> {
     let short_names_bucket = env_text("SHORT_NAMES_BUCKET");
     let mut short_names = ShortNames::default();
     if gemini_model.is_some() || short_names_bucket.is_some() {
-        // 同一個商品出現在多筆訂單時只算一次。
+        // 不去重：同一個商品在不同訂單上的名稱可能不同（賣場改過名稱），
+        // 報表的 shortNames 要逐筆比對；問 Gemini 前才在 resolve_short_names 裡去重。
         let products: Vec<(String, String)> = reminders
             .iter()
             .flat_map(|reminder| &reminder.groups)
             .flat_map(|group| group["items"].as_array().into_iter().flatten())
             .filter_map(|item| Some((product_key(item), item["name"].as_str()?.to_string())))
             .filter(|(_, name)| !name.trim().is_empty())
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
             .collect();
         if !products.is_empty() {
             short_names = resolve_short_names(
@@ -1245,7 +1426,7 @@ async fn run() -> Result<(), String> {
             }
         }
         for reminder in &mut reminders {
-            reminder.products = product_text(&reminder.groups, &short_names.used);
+            reminder.products = product_text(&reminder.groups, &short_names.table);
         }
     }
 
@@ -1351,9 +1532,21 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(message) = run().await {
+        fail(&message);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+        future::{ready, Ready},
+    };
 
     #[test]
     fn ordered_date_uses_taipei_calendar_day() {
@@ -1383,9 +1576,165 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
         assert_eq!((today - ordered).num_days(), 8);
         assert_eq!(
-            short_date(ordered + TimeDelta::days(DEFAULT_DEADLINE_DAYS)),
+            short_date(deadline_date(ordered, DEFAULT_DEADLINE_DAYS).unwrap()),
             "11/14（六）"
         );
+    }
+
+    #[test]
+    fn deadline_arithmetic_is_checked() {
+        let date = |y, m, d| NaiveDate::from_ymd_opt(y, m, d);
+        let day = |y, m, d| date(y, m, d).unwrap();
+        assert_eq!(deadline_date(day(2026, 11, 5), 9), date(2026, 11, 14));
+        // 跨年、閏日。
+        assert_eq!(deadline_date(day(2026, 12, 28), 9), date(2027, 1, 6));
+        assert_eq!(deadline_date(day(2028, 2, 20), 9), date(2028, 2, 29));
+        // 離譜的天數回報設定錯誤，不能 panic。
+        for days in [1_000_000_000_000, i64::MAX] {
+            assert_eq!(deadline_date(day(2026, 11, 14), days), None);
+            let error = query_range(None, None, Some("2026-11-14"), days).unwrap_err();
+            assert!(error.contains("DEADLINE_DAYS"), "{error}");
+            // 有帶 --from 時查詢範圍用不到期限。
+            assert!(query_range(Some("2026-11-01"), None, Some("2026-11-14"), days).is_ok());
+        }
+        // TimeDelta 裝得下、但日期超出範圍的天數。
+        assert_eq!(deadline_date(day(2026, 11, 14), 100_000_000), None);
+        assert!(query_range(None, None, Some("2026-11-14"), 100_000_000).is_err());
+
+        // orderedAt 來自訂單資料：極端數值當成無法解析，不能溢位。
+        assert_eq!(ordered_date(&json!(i64::MIN)), None);
+        assert_eq!(ordered_date(&json!(i64::MAX)), None);
+    }
+
+    #[test]
+    fn envelope_requires_result_object() {
+        for envelope in [
+            json!({ "success": true }),
+            json!({ "success": true, "result": null }),
+            json!({ "success": true, "result": [] }),
+            json!({ "success": true, "result": "ok" }),
+        ] {
+            let error = envelope_result("/p", envelope).unwrap_err();
+            assert!(error.contains("result") && error.contains("/p"), "{error}");
+        }
+        assert_eq!(
+            envelope_result("/p", json!({ "success": true, "result": { "a": 1 } })),
+            Ok(json!({ "a": 1 }))
+        );
+        assert_eq!(
+            envelope_result(
+                "/p",
+                json!({ "success": false, "errors": [{ "code": "E1", "message": "壞了" }] })
+            ),
+            Err("LINE Gift API 失敗 (/p): E1 壞了".to_string())
+        );
+        assert_eq!(
+            envelope_result("/p", json!({ "error": { "message": "x" } })),
+            Err("LINE Gift API 失敗 (/p): UNKNOWN x".to_string())
+        );
+    }
+
+    #[test]
+    fn order_list_shape() {
+        let page =
+            |total: u64, list: Value| json!({ "paginate": { "totalCount": total }, "list": list });
+        // 數字和字串的 id 都接受。
+        assert_eq!(
+            order_page(&page(2, json!([{ "id": 11 }, { "id": "A-2" }])), 0),
+            Ok((2, vec!["11".to_string(), "A-2".to_string()]))
+        );
+        // 沒有訂單時省略 list 是正常的空清單；空陣列一律合法（分頁期間狀態改變）。
+        assert_eq!(
+            order_page(&json!({ "paginate": { "totalCount": 0 } }), 0),
+            Ok((0, vec![]))
+        );
+        assert_eq!(order_page(&page(0, Value::Null), 0), Ok((0, vec![])));
+        assert_eq!(order_page(&page(3, json!([])), 0), Ok((3, vec![])));
+        // 依總數已經沒有下一頁時，缺 list 不算錯。
+        assert_eq!(
+            order_page(&json!({ "paginate": { "totalCount": 100 } }), 1),
+            Ok((100, vec![]))
+        );
+        // 應該有資料卻沒有 list、list 型別不對、訂單沒有 id，都是格式錯誤。
+        assert!(order_page(&json!({ "paginate": { "totalCount": 3 } }), 0).is_err());
+        assert!(order_page(&json!({ "paginate": { "totalCount": 101 } }), 1).is_err());
+        assert!(order_page(&page(3, json!({})), 0).is_err());
+        assert!(order_page(&page(0, json!("x")), 0).is_err());
+        assert!(order_page(&page(1, json!([{ "id": null }])), 0).is_err());
+        assert!(order_page(&page(1, json!([{}])), 0).is_err());
+        assert!(order_page(&page(1, json!([{ "id": "" }])), 0).is_err());
+        assert!(order_page(&json!({ "list": [] }), 0).is_err());
+    }
+
+    #[test]
+    fn order_detail_shape() {
+        for bad in [
+            json!({}),
+            json!({ "items": null, "deliveryGroups": [] }),
+            json!({ "items": {}, "deliveryGroups": [] }),
+            json!({ "items": [], "deliveryGroups": "x" }),
+            json!({ "items": [], "deliveryGroups": {} }),
+        ] {
+            let error = check_order_detail("A-1", &bad).unwrap_err();
+            assert!(error.contains("A-1"), "{error}");
+        }
+        // 沒有配送群組、沒有品項都是合法的（清單與詳情之間狀態可能改變）。
+        assert_eq!(check_order_detail("1", &json!({ "items": [] })), Ok(()));
+        assert_eq!(
+            check_order_detail("1", &json!({ "items": [], "deliveryGroups": null })),
+            Ok(())
+        );
+        assert_eq!(
+            check_order_detail(
+                "1",
+                &json!({ "items": [{ "id": 1 }], "deliveryGroups": [] })
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn pending_groups_only_contains_unaddressed_paid_items() {
+        let order = json!({
+            "items": [
+                { "id": 1, "productId": 7, "productName": "茶", "status": "PAYED", "quantity": 2, "optionNames": ["紅", "L"] },
+                { "id": 2, "productId": 8, "productName": "卡片", "status": "CANCELED", "quantity": 1 },
+                { "id": 3, "productId": 9, "productName": "杯子", "status": "PAYED", "quantity": 1 },
+                { "id": 4, "productId": 10, "productName": "餅乾", "status": "PAYED", "quantity": 1 },
+            ],
+            "deliveryGroups": [
+                // 還沒填表單（deliveryForm 為 null）：待填。已取消的品項不列。
+                { "id": "g1", "itemIds": [1, 2], "deliveryForm": null },
+                // 已選超商：不列。
+                { "id": "g2", "itemIds": [3], "deliveryForm": { "name": "王", "cvsAddress": { "storeId": "123" } } },
+                // 表單只有姓名、地址空白：待填。
+                { "id": "g3", "itemIds": [4], "deliveryForm": { "name": "李", "generalAddress": { "baseAddress": " " } } },
+                // 沒有品項的群組：不列。
+                { "id": "g4", "deliveryForm": null },
+            ],
+        });
+        let groups = pending_groups(&order, false);
+        assert_eq!(
+            groups,
+            vec![
+                json!({
+                    "groupId": "g1",
+                    "recipient": "",
+                    "deliveryFormFields": [],
+                    "items": [{ "id": 1, "productId": 7, "name": "茶", "spec": "紅 / L", "qty": 2 }],
+                }),
+                json!({
+                    "groupId": "g3",
+                    "recipient": "李",
+                    "deliveryFormFields": ["name", "generalAddress"],
+                    "items": [{ "id": 4, "productId": 10, "name": "餅乾", "spec": "", "qty": 1 }],
+                }),
+            ]
+        );
+        // --raw 才附上完整表單。
+        assert_eq!(pending_groups(&order, true)[0]["deliveryForm"], Value::Null);
+        assert!(pending_groups(&order, true)[1]["deliveryForm"].is_object());
+        assert!(pending_groups(&json!({ "items": [] }), false).is_empty());
     }
 
     fn default_config() -> Config {
@@ -1400,7 +1749,8 @@ mod tests {
     #[test]
     fn query_range_follows_today_when_backfilling() {
         // 補寄 11/10：滿 8 天的 11/2 訂單、最後填寫日當天的 11/1 訂單都要查得到。
-        let (from, to) = query_range(None, None, Some("2026-11-10"), DEFAULT_DEADLINE_DAYS);
+        let (from, to) =
+            query_range(None, None, Some("2026-11-10"), DEFAULT_DEADLINE_DAYS).unwrap();
         assert_eq!(to, taipei_day("2026-11-10", true));
         assert!(from < taipei_day("2026-11-01", false));
 
@@ -1410,7 +1760,8 @@ mod tests {
             Some("2026-11-12"),
             Some("2026-11-10"),
             DEFAULT_DEADLINE_DAYS,
-        );
+        )
+        .unwrap();
         assert_eq!(from, taipei_day("2026-11-05", false));
         assert_eq!(to, taipei_day("2026-11-12", true));
     }
@@ -1584,6 +1935,258 @@ mod tests {
             "322533113"
         );
         assert_eq!(product_key(&json!({ "productId": null, "name": "a" })), "a");
+
+        // 組信時套用的表：空白 short（104）不套用，其餘全部套用（含和原名相同的 102），short 去頭尾空白。
+        let applied = applied_short_names(&table);
+        assert_eq!(
+            applied.keys().collect::<Vec<_>>(),
+            ["101", "102", "103", "999"]
+        );
+        let padded = BTreeMap::from([("1".to_string(), entry("茶葉禮盒", " 茶葉 "))]);
+        assert_eq!(applied_short_names(&padded)["1"], entry("茶葉禮盒", "茶葉"));
+    }
+
+    #[test]
+    fn short_name_applies_to_every_name_variant() {
+        let entry = |name: &str, short: &str| ShortName {
+            name: name.to_string(),
+            short: short.to_string(),
+        };
+        // 同一個商品在兩筆訂單上的名稱不同，其中一個剛好等於表裡的 short。
+        let table = BTreeMap::from([("7".to_string(), entry("Original Tea", "Tea"))]);
+        let group =
+            |name: &str| vec![json!({ "items": [{ "productId": 7, "name": name, "qty": 1 }] })];
+        let pair = |name: &str| ("7".to_string(), name.to_string());
+        let applied = applied_short_names(&table);
+        for names in [["Promo Tea", "Tea"], ["Tea", "Promo Tea"]] {
+            // 兩筆訂單都要用短名，和順序無關。
+            for name in names {
+                assert_eq!(product_text(&group(name), &applied), "Tea");
+            }
+            // 報表用未去重的清單算：有一筆名稱不同就列入，name 是那個不同的名稱。
+            let products = names.map(pair);
+            assert_eq!(
+                used_short_names(&products, &table),
+                BTreeMap::from([("7".to_string(), entry("Promo Tea", "Tea"))])
+            );
+            // 送給 Gemini 的清單每個商品只留一個。
+            assert_eq!(unique_products(&products).len(), 1);
+        }
+        // 每一筆的名稱都等於 short 時不算換名稱。
+        assert!(used_short_names(&[pair("Tea"), pair("Tea")], &table).is_empty());
+    }
+
+    /// 不開 socket 的假 Cloud Storage：當成 load／save 的送出函式，依序回覆排好的
+    /// (狀態碼, 內文)，並記下每個組好的請求。排好的回應用完後再有請求就直接 panic。
+    struct FakeStorage {
+        responses: RefCell<VecDeque<(u16, &'static str)>>,
+        requests: RefCell<Vec<reqwest::Request>>,
+    }
+
+    impl FakeStorage {
+        fn new(responses: &[(u16, &'static str)]) -> Self {
+            Self {
+                responses: RefCell::new(responses.iter().copied().collect()),
+                requests: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn send(&self, request: RequestBuilder) -> Ready<Result<(StatusCode, String), String>> {
+            let request = request.build().unwrap();
+            let (status, body) = self
+                .responses
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| panic!("多餘的請求：{}", request_line(&request)));
+            self.requests.borrow_mut().push(request);
+            ready(Ok((
+                StatusCode::from_u16(status).unwrap(),
+                body.to_string(),
+            )))
+        }
+
+        /// 排好的回應必須全部被請求過；回傳依序送出的請求。每個請求都要打正式位址並帶權杖。
+        fn finish(self) -> Vec<reqwest::Request> {
+            assert!(
+                self.responses.borrow().is_empty(),
+                "還有 {} 個排好的回應沒有被請求",
+                self.responses.borrow().len()
+            );
+            let requests = self.requests.into_inner();
+            for request in &requests {
+                assert_eq!(
+                    request.url().origin().ascii_serialization(),
+                    STORAGE_ENDPOINT
+                );
+                assert_eq!(request.headers()["authorization"], "Bearer fake-token");
+            }
+            requests
+        }
+    }
+
+    /// 例如「GET /storage/v1/b/b/o/short-names.json?fields=generation」。
+    fn request_line(request: &reqwest::Request) -> String {
+        let url = request.url();
+        format!(
+            "{} {}?{}",
+            request.method(),
+            url.path(),
+            url.query().unwrap_or_default()
+        )
+    }
+
+    const TABLE_BODY: &str = r#"{ "7": { "name": "Original Tea", "short": "Tea" } }"#;
+
+    async fn fake_load(
+        storage: &FakeStorage,
+    ) -> Result<(BTreeMap<String, ShortName>, u64), String> {
+        let send = |request| storage.send(request);
+        load_short_names_with(send, &Client::new(), "fake-token", "b").await
+    }
+
+    async fn fake_save(
+        storage: &FakeStorage,
+        table: &BTreeMap<String, ShortName>,
+        generation: u64,
+    ) -> Result<(), String> {
+        let send = |request| storage.send(request);
+        save_short_names_with(send, &Client::new(), "fake-token", "b", table, generation).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_name_table_is_read_at_one_generation() {
+        let storage = FakeStorage::new(&[
+            (200, r#"{ "generation": "1700000000000001" }"#),
+            (200, TABLE_BODY),
+        ]);
+        let (table, generation) = fake_load(&storage).await.unwrap();
+        assert_eq!(generation, 1_700_000_000_000_001);
+        assert_eq!(table["7"].short, "Tea");
+        let requests = storage.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            request_line(&requests[0]),
+            "GET /storage/v1/b/b/o/short-names.json?fields=generation"
+        );
+        // 內容指定 metadata 給的那一版。
+        assert_eq!(
+            request_line(&requests[1]),
+            "GET /storage/v1/b/b/o/short-names.json?alt=media&generation=1700000000000001"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_short_name_table_is_empty_at_generation_zero() {
+        // 只排一個回應：如果程式多發了讀內容的請求，FakeStorage 會 panic。
+        let storage = FakeStorage::new(&[(404, r#"{ "error": { "code": 404 } }"#)]);
+        assert_eq!(fake_load(&storage).await, Ok((BTreeMap::new(), 0)));
+        let requests = storage.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            request_line(&requests[0]),
+            "GET /storage/v1/b/b/o/short-names.json?fields=generation"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreadable_short_name_table_is_an_error() {
+        // metadata 之後檔案被換掉或刪掉：那一版已經不存在。
+        let storage = FakeStorage::new(&[(200, r#"{ "generation": "5" }"#), (404, "{}")]);
+        let error = fake_load(&storage).await.unwrap_err();
+        assert!(error.contains("讀取途中"), "{error}");
+        let requests = storage.finish();
+        assert_eq!(
+            request_line(&requests[1]),
+            "GET /storage/v1/b/b/o/short-names.json?alt=media&generation=5"
+        );
+
+        // 內容讀取失敗、內容格式不對。
+        let storage = FakeStorage::new(&[(200, r#"{ "generation": "5" }"#), (500, "boom")]);
+        let error = fake_load(&storage).await.unwrap_err();
+        assert!(error.contains("500") && error.contains("boom"), "{error}");
+        assert_eq!(storage.finish().len(), 2);
+        let storage = FakeStorage::new(&[(200, r#"{ "generation": "5" }"#), (200, "[]")]);
+        let error = fake_load(&storage).await.unwrap_err();
+        assert!(error.contains("格式不對"), "{error}");
+        assert_eq!(storage.finish().len(), 2);
+
+        // metadata 沒有可用的 generation，或 metadata 本身讀不到：不再讀內容。
+        for metadata in [
+            (200, "{}"),
+            (200, r#"{ "generation": 5 }"#),
+            (200, r#"{ "generation": "abc" }"#),
+            (200, r#"{ "generation": "+5" }"#),
+            (200, r#"{ "generation": "" }"#),
+            (200, "not json"),
+            (403, "denied"),
+        ] {
+            let storage = FakeStorage::new(&[metadata]);
+            let loaded = fake_load(&storage).await;
+            assert!(loaded.is_err(), "{metadata:?}");
+            assert_eq!(storage.finish().len(), 1);
+        }
+
+        // 連不上：錯誤指出是讀取對照表時發生的。
+        let offline = |_| ready(Err("連線失敗: offline".to_string()));
+        let error = load_short_names_with(offline, &Client::new(), "fake-token", "b")
+            .await
+            .unwrap_err();
+        assert_eq!(error, "讀取商品名稱對照表連線失敗: offline");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_name_table_is_written_only_if_unchanged() {
+        let table = parse_short_names(TABLE_BODY).unwrap();
+        // 讀到的 generation 原樣帶進寫入條件；原本不存在時是 0（只允許新建）。
+        for generation in [1_700_000_000_000_001_u64, 0] {
+            let storage = FakeStorage::new(&[(200, "{}")]);
+            assert_eq!(fake_save(&storage, &table, generation).await, Ok(()));
+            let requests = storage.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                request_line(&requests[0]),
+                format!(
+                    "POST /upload/storage/v1/b/b/o?uploadType=media&name=short-names.json\
+                     &ifGenerationMatch={generation}"
+                )
+            );
+            assert_eq!(
+                requests[0].headers()["content-type"],
+                "application/json; charset=utf-8"
+            );
+            let body = requests[0].body().and_then(|body| body.as_bytes()).unwrap();
+            assert_eq!(
+                parse_short_names(std::str::from_utf8(body).unwrap()),
+                Ok(table.clone())
+            );
+        }
+
+        // 期間被別人改過：回報衝突，只發這一次請求（不重讀、不重試）。
+        let storage = FakeStorage::new(&[(412, r#"{ "error": "conditionNotMet" }"#)]);
+        let error = fake_save(&storage, &table, 5).await.unwrap_err();
+        assert!(
+            error.contains("被改過") && !error.contains("conditionNotMet"),
+            "{error}"
+        );
+        let requests = storage.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(request_line(&requests[0]).ends_with("&ifGenerationMatch=5"));
+
+        // 其他寫入失敗照舊回報 HTTP 狀態；連不上也只試一次。
+        let storage = FakeStorage::new(&[(403, "denied")]);
+        let error = fake_save(&storage, &table, 5).await.unwrap_err();
+        assert!(error.contains("403") && error.contains("denied"), "{error}");
+        assert_eq!(storage.finish().len(), 1);
+        let attempts = Cell::new(0);
+        let offline = |_| {
+            attempts.set(attempts.get() + 1);
+            ready(Err("連線失敗: offline".to_string()))
+        };
+        let error = save_short_names_with(offline, &Client::new(), "fake-token", "b", &table, 5)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "寫入商品名稱對照表連線失敗: offline");
+        assert_eq!(attempts.get(), 1);
     }
 
     #[test]
@@ -1636,11 +2239,18 @@ mod tests {
             .html(&config)
             .contains("<b>11/5（四）</b> 下單，訂單 1</div>"));
     }
-}
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    if let Err(message) = run().await {
-        fail(&message);
+    #[test]
+    fn escaped_values_stay_inside_quoted_attributes() {
+        assert_eq!(
+            escape_html("O'Reilly & <b>\"x\""),
+            "O&#39;Reilly &amp; &lt;b&gt;&quot;x&quot;"
+        );
+        let value =
+            |name: &str| (name == "sender_name").then(|| escape_html("x' style='display:none"));
+        assert_eq!(
+            render("<p title='{sender_name}'>Notice</p>", value),
+            "<p title='x&#39; style=&#39;display:none'>Notice</p>"
+        );
     }
 }
