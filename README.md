@@ -41,6 +41,64 @@ cargo run --release -- --today=2026-11-13 --max=500
 | `MAIL_SUMMARY_TO` | 統整信收件人，可用逗號分隔多個；未設定時寄給 `MAIL_SENDER` |
 | `MAIL_FROM_NAME` | 寄件人顯示名稱（選填） |
 | `MAIL_REPLY_TO` | 收件人按「回覆」時的收件地址（選填）；未設定時回到 `MAIL_SENDER` |
+| `GEMINI_MODEL` | 選填。設定後用 Vertex AI 濃縮信裡的商品名稱，見「濃縮商品名稱」 |
+| `SHORT_NAMES_BUCKET` | 選填。存放商品名稱對照表的 Cloud Storage bucket，見「濃縮商品名稱」 |
+| `GOOGLE_CLOUD_PROJECT` | 選填。Vertex AI 用的專案 ID；Cloud Run 內不必設 |
+| `GOOGLE_ACCESS_TOKEN` | 本機測試上面兩項用：`gcloud auth print-access-token` 的輸出 |
+
+## 濃縮商品名稱（選用）
+
+商品名稱常帶有促銷字眼（例如「【限時免運】★熱銷破萬★」）。設定 `GEMINI_MODEL` 後，程式會把今天要提醒的訂單裡的商品名稱
+交給 Vertex AI 的 Gemini 去掉這些字眼，信裡的 `{products}` 和統整信都改用濃縮後的名稱。沒設定時行為和原本完全一樣。
+
+- 只送商品名稱，不送姓名、email、訂單編號。
+- 任何失敗（權限、逾時、回傳筆數對不上）都退回原名，提醒信照寄；統整信會用紅字註明，輸出的 `reminders.shortNameError` 有原因。
+- 沒有變短的結果不採用。輸出的 `reminders.shortNames` 列出這次信裡換掉名稱的商品（鍵是 `productId`，`name` 是原名、`short` 是信裡用的名稱）。
+- 預覽（沒帶 `--send`）時也會濃縮，正式啟用前請先預覽幾次確認結果。
+- 模型的輸出不保證每次相同，同一個商品在不同天的信裡名稱可能略有差異；要固定下來請搭配下方的對照表。
+
+啟用步驟（只需一次）：
+
+```powershell
+gcloud services enable aiplatform.googleapis.com
+gcloud projects add-iam-policy-binding 你的專案ID `
+  --member="serviceAccount:line-gift-pending-address-job@你的專案ID.iam.gserviceaccount.com" `
+  --role="roles/aiplatform.user"
+```
+
+再到 Cloud Run 主控台替 Job 新增環境變數 `GEMINI_MODEL`，值填 Vertex AI 上的型號 ID，例如 `gemini-3.1-flash-lite`。
+型號會汰換，下架後濃縮會失敗（信仍以原名寄出），到時換成新的型號 ID 即可；拿掉這個變數就停用。
+要啟用的是 Vertex AI API（`aiplatform.googleapis.com`），不是 Discovery Engine API。
+
+### 對照表（選用）
+
+設定 `SHORT_NAMES_BUCKET` 後，濃縮結果會累積在該 bucket 的 `short-names.json`，以 LINE 的商品編號（`productId`）為鍵：
+
+```json
+{
+  "322533113": { "name": "【限時免運】★熱銷破萬★ 鳳梨酥禮盒 12入", "short": "鳳梨酥禮盒 12入" }
+}
+```
+
+`short` 是信裡要用的名稱；`name` 是加入當時的原始名稱，只是給人對照用的。
+
+- 表裡已經有的商品直接用 `short`，不再問 Gemini，所以同一個商品每次的名稱都一樣。
+- 因為是用商品編號對照，**在賣場改了商品名稱（例如換一批促銷字眼）信裡的名稱也不會變**。
+- 表裡沒有的才問 Gemini，結果寫回表裡；沒變短的 `short` 會和 `name` 一樣，之後不會重問。
+- 統整信和輸出的 `reminders.newShortNames` 會列出這次新加的項目。不滿意就到 Cloud Storage 主控台下載
+  `short-names.json`、改掉 `short` 再上傳覆蓋；手動改的名稱不受「必須比原名短」的限制。想讓某個商品重新濃縮，把那一筆刪掉即可。
+- 預覽（沒帶 `--send`）時也會寫入對照表。
+- 只設 `SHORT_NAMES_BUCKET`、不設 `GEMINI_MODEL` 也可以：這時只查表，表完全由你手動維護。
+- 表讀不到或格式壞掉時，這次全部用原名而且不會寫回，既有的表不會被蓋掉。
+
+```powershell
+gcloud storage buckets create gs://你的bucket名稱 --location=asia-east1 --uniform-bucket-level-access
+gcloud storage buckets add-iam-policy-binding gs://你的bucket名稱 `
+  --member="serviceAccount:line-gift-pending-address-job@你的專案ID.iam.gserviceaccount.com" `
+  --role="roles/storage.objectUser"
+```
+
+再替 Job 新增環境變數 `SHORT_NAMES_BUCKET`，值填 bucket 名稱（不含 `gs://`）。
 
 ## 不改程式就能調整的設定
 
@@ -59,7 +117,7 @@ push 觸發的自動部署不會動到環境變數，不會蓋掉這些值。
 
 | 代碼 | 內容 | 範例 |
 | --- | --- | --- |
-| `{products}` | 尚未填地址的商品 | 禮盒（紅 / L） ×2、卡片 |
+| `{products}` | 尚未填地址的商品（有設 `GEMINI_MODEL` 時是濃縮後的名稱） | 禮盒（紅 / L） ×2、卡片 |
 | `{deadline}` | 最後填寫地址日期 | 11/14（六） |
 | `{ordered}` | 下單日 | 11/5（四） |
 | `{days}` | 今天是下單後第幾天 | 8 |
@@ -262,5 +320,6 @@ gcloud scheduler jobs create http line-gift-pending-address-daily `
 | `skipped` | 沒有 email 或格式不正確，未寄 |
 
 有任何一封寄送失敗（含統整信）時，Job 會以失敗狀態結束，但報表仍會先印出。
+商品名稱濃縮失敗不算寄送失敗：信以原名寄出，Job 仍以成功狀態結束。
 
 輸出與統整信都含收禮人姓名與送禮人 email，請留意 log 的存取權限與保存期限。

@@ -14,6 +14,12 @@
 //!   REMINDER_DAYS            下單滿幾天要提醒，逗號分隔（預設 5,8）。
 //!   DEADLINE_DAYS            最後填寫地址日期 = 下單日 + 這個天數（預設 9）。
 //!   MAIL_SUBJECT / MAIL_BODY 提醒信的主旨與內文（HTML）範本，可用 {products} {deadline} 等代碼。
+//!   GEMINI_MODEL             設定後（例如 gemini-3.1-flash-lite）用 Vertex AI 濃縮信裡的商品名稱，
+//!                            去掉促銷字眼；未設定時用原名。只送商品名稱，失敗時退回原名、信照寄。
+//!   SHORT_NAMES_BUCKET       設定後把「商品編號 → 短名」對照表存在這個 Cloud Storage bucket 的 short-names.json：
+//!                            表裡有的直接用，沒有的才問 Gemini 並寫回。可以手動修改這個檔案。
+//!   GOOGLE_CLOUD_PROJECT     Vertex AI 用的專案 ID；未設定時向 metadata server 查（Cloud Run 內不必設）。
+//!   GOOGLE_ACCESS_TOKEN      本機測試上面兩項用：gcloud auth print-access-token 的輸出。
 //!
 //! 參數：
 //!   --from / --to  台北時間的日期（YYYY-MM-DD），以訂單成立時間篩選；未指定時查最近 DEADLINE_DAYS + 1 天（有帶 --today 時從那一天往回算）。
@@ -26,7 +32,12 @@
 //! 程式不記錄寄過誰：是否提醒完全由「今天 − 下單日」決定，所以同一天執行兩次會寄兩次，
 //! 某天沒執行則那天該提醒的訂單會被跳過（可用 --today 補寄）。
 
-use std::{collections::HashMap, env, process::exit, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    process::exit,
+    time::Duration,
+};
 
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE},
@@ -34,7 +45,7 @@ use base64::{
 };
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, TimeDelta, Utc};
 use futures::future::try_join_all;
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 
 const ORDER_PATH: &str = "/order2/v1/order/orders";
@@ -334,6 +345,7 @@ fn pending_groups(order: &Value, raw: bool) -> Vec<Value> {
             "deliveryFormFields": form.as_object().map(|fields| fields.keys().collect::<Vec<_>>()).unwrap_or_default(),
             "items": paid_items.iter().map(|item| json!({
                 "id": item["id"],
+                "productId": item["productId"],
                 "name": item["productName"],
                 "spec": item["optionNames"].as_array().into_iter().flatten().map(|name| text(name, "")).collect::<Vec<_>>().join(" / "),
                 "qty": item["quantity"],
@@ -378,12 +390,25 @@ fn short_date(date: NaiveDate) -> String {
     )
 }
 
-fn product_text(groups: &[Value]) -> String {
+/// 對照表的鍵：LINE 的商品編號（productId）。賣場改了商品名稱也還是同一個鍵，
+/// 所以信裡的名稱不會跟著變。LINE 沒給編號時退而用商品名稱。
+fn product_key(item: &Value) -> String {
+    match &item["productId"] {
+        Value::Null => text(&item["name"], ""),
+        id => text(id, ""),
+    }
+}
+
+/// short_names 是「商品鍵（見 product_key）→ 信裡要用的名稱」；查不到的用原名。
+fn product_text(groups: &[Value], short_names: &BTreeMap<String, ShortName>) -> String {
     groups
         .iter()
         .flat_map(|group| group["items"].as_array().into_iter().flatten())
         .map(|item| {
-            let mut label = text(&item["name"], "商品");
+            let mut label = match short_names.get(&product_key(item)) {
+                Some(entry) => entry.short.clone(),
+                None => text(&item["name"], "商品"),
+            };
             let spec = text(&item["spec"], "");
             if !spec.is_empty() {
                 label.push_str(&format!("（{spec}）"));
@@ -486,6 +511,287 @@ async fn google_json(request: RequestBuilder, what: &str) -> Result<Value, Strin
         .map_err(|error| format!("{what}回應不是 JSON: {error}"))
 }
 
+const SHORTEN_INSTRUCTION: &str = "你會收到一個商品名稱的 JSON 陣列。\
+    請去掉促銷、聳動、SEO 用的字眼，只保留品牌、品名與必要規格，不可新增原文沒有的資訊。\
+    回傳同樣長度、同樣順序的 JSON 字串陣列。";
+
+/// 從 generateContent 的回應取出「原名 → 濃縮後名稱」，只留真的有變短的。
+/// 筆數對不上就整批不用：對錯位置會讓信裡出現別的商品。
+fn short_name_map(names: &[String], response: &Value) -> Result<BTreeMap<String, String>, String> {
+    // 被內容過濾擋下時沒有 parts；思考片段（thought）可能排在答案前面。
+    let answer: String = response["candidates"][0]["content"]["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["thought"] != true)
+        .filter_map(|part| part["text"].as_str())
+        .collect();
+    let short: Vec<String> = serde_json::from_str(&answer).map_err(|error| {
+        format!(
+            "Gemini 沒有回傳字串陣列（finishReason {}）: {error}",
+            text(&response["candidates"][0]["finishReason"], "無")
+        )
+    })?;
+    if short.len() != names.len() {
+        return Err(format!(
+            "Gemini 回傳 {} 筆，和送出的 {} 筆對不上。",
+            short.len(),
+            names.len()
+        ));
+    }
+    Ok(names
+        .iter()
+        .zip(short)
+        .map(|(name, short)| (name.clone(), short.trim().to_string()))
+        .filter(|(name, short)| !short.is_empty() && short.chars().count() < name.chars().count())
+        .collect())
+}
+
+async fn gcp_metadata(client: &Client, path: &str) -> Result<String, String> {
+    google_text(
+        client
+            .get(format!(
+                "http://metadata.google.internal/computeMetadata/v1/{path}"
+            ))
+            .header("Metadata-Flavor", "Google"),
+        "讀取 GCP metadata（本機請設 GOOGLE_CLOUD_PROJECT 與 GOOGLE_ACCESS_TOKEN）",
+    )
+    .await
+}
+
+/// 執行身分（Cloud Run 的服務帳號）的存取權杖，Vertex AI 和 Cloud Storage 共用。
+async fn gcp_token(client: &Client) -> Result<String, String> {
+    if let Some(token) = env_text("GOOGLE_ACCESS_TOKEN") {
+        return Ok(token);
+    }
+    let token: Value = serde_json::from_str(
+        &gcp_metadata(client, "instance/service-accounts/default/token").await?,
+    )
+    .map_err(|error| format!("GCP 權杖回應不是 JSON: {error}"))?;
+    Ok(token["access_token"]
+        .as_str()
+        .ok_or("GCP 權杖回應缺少 access_token。")?
+        .to_string())
+}
+
+/// 對照表在 bucket 裡的物件名稱，格式見 parse_short_names。
+const SHORT_NAMES_OBJECT: &str = "short-names.json";
+
+/// 讀 Cloud Storage 上的對照表；物件還不存在時是空表。
+async fn load_short_names(
+    client: &Client,
+    token: &str,
+    bucket: &str,
+) -> Result<BTreeMap<String, ShortName>, String> {
+    let response = client
+        .get(format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{SHORT_NAMES_OBJECT}?alt=media",
+            encode_path_segment(bucket)
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("讀取商品名稱對照表連線失敗: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("讀取商品名稱對照表失敗: {error}"))?;
+    // bucket 不存在也是 404，那種情況之後寫回時會失敗並回報。
+    if status == StatusCode::NOT_FOUND {
+        return Ok(BTreeMap::new());
+    }
+    if !status.is_success() {
+        let detail: String = body.chars().take(300).collect();
+        return Err(format!(
+            "讀取商品名稱對照表失敗 HTTP {}: {detail}",
+            status.as_u16()
+        ));
+    }
+    parse_short_names(&body)
+}
+
+/// 對照表檔案的格式：{"商品編號": {"name": "加入時的原始名稱", "short": "信裡要用的名稱"}}。
+/// name 只是給人對照用的；有一筆格式不對就整份不用，免得之後寫回時把手動改的內容弄丟。
+fn parse_short_names(body: &str) -> Result<BTreeMap<String, ShortName>, String> {
+    let bad = |detail: String| format!("商品名稱對照表 {SHORT_NAMES_OBJECT} 格式不對: {detail}");
+    let entries: BTreeMap<String, Value> =
+        serde_json::from_str(body).map_err(|error| bad(error.to_string()))?;
+    entries
+        .into_iter()
+        .map(|(key, entry)| {
+            let short = entry["short"]
+                .as_str()
+                .ok_or_else(|| bad(format!("{key} 缺少文字欄位 short")))?
+                .to_string();
+            let name = text(&entry["name"], "");
+            Ok((key, ShortName { name, short }))
+        })
+        .collect()
+}
+
+async fn save_short_names(
+    client: &Client,
+    token: &str,
+    bucket: &str,
+    table: &BTreeMap<String, ShortName>,
+) -> Result<(), String> {
+    let entries: BTreeMap<&String, Value> = table
+        .iter()
+        .map(|(key, entry)| (key, entry.json()))
+        .collect();
+    let body = serde_json::to_string_pretty(&entries).map_err(|error| error.to_string())?;
+    google_text(
+        client
+            .post(format!(
+                "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={SHORT_NAMES_OBJECT}",
+                encode_path_segment(bucket)
+            ))
+            .bearer_auth(token)
+            .header("Content-Type", "application/json; charset=utf-8")
+            .body(body),
+        "寫入商品名稱對照表",
+    )
+    .await
+    .map(|_| ())
+}
+
+/// 一個商品的原始名稱（name）和信裡要用的名稱（short）。
+#[derive(Clone, Debug, PartialEq)]
+struct ShortName {
+    name: String,
+    short: String,
+}
+
+impl ShortName {
+    fn json(&self) -> Value {
+        json!({ "name": self.name, "short": self.short })
+    }
+}
+
+fn short_names_json(entries: &BTreeMap<String, ShortName>) -> Value {
+    entries
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.json()))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
+/// 這次執行的商品名稱濃縮結果，鍵都是 product_key。
+#[derive(Default)]
+struct ShortNames {
+    /// 信裡實際換掉名稱的商品（name 是訂單上現在的名稱）。
+    used: BTreeMap<String, ShortName>,
+    /// 這次新加進對照表的商品（沒變短的 short 會和 name 一樣）。
+    added: BTreeMap<String, ShortName>,
+    error: Option<String>,
+}
+
+/// products 是今天要提醒的商品（鍵、訂單上的名稱）。對照表裡 short 和現在的名稱不同的才算有換名稱。
+fn used_short_names(
+    products: &[(String, String)],
+    table: &BTreeMap<String, ShortName>,
+) -> BTreeMap<String, ShortName> {
+    products
+        .iter()
+        .filter_map(|(key, name)| {
+            let short = table.get(key)?.short.trim().to_string();
+            let name = name.clone();
+            (!short.is_empty() && short != name).then(|| (key.clone(), ShortName { name, short }))
+        })
+        .collect()
+}
+
+/// 先查對照表（有設 bucket 時），表裡沒有的才問 Gemini（有設 model 時），問到的結果寫回對照表。
+/// 對照表讀不到時整批用原名而且不寫回，避免把既有的表蓋掉。
+async fn resolve_short_names(
+    client: &Client,
+    model: Option<&str>,
+    bucket: Option<&str>,
+    products: &[(String, String)],
+) -> ShortNames {
+    let mut result = ShortNames::default();
+    let token = match gcp_token(client).await {
+        Ok(token) => token,
+        Err(error) => {
+            result.error = Some(error);
+            return result;
+        }
+    };
+    let mut table = BTreeMap::new();
+    if let Some(bucket) = bucket {
+        match load_short_names(client, &token, bucket).await {
+            Ok(loaded) => table = loaded,
+            Err(error) => {
+                result.error = Some(error);
+                return result;
+            }
+        }
+    }
+    let unknown: Vec<&(String, String)> = products
+        .iter()
+        .filter(|(key, _)| !table.contains_key(key))
+        .collect();
+    if let (Some(model), false) = (model, unknown.is_empty()) {
+        let names: Vec<String> = unknown.iter().map(|(_, name)| name.clone()).collect();
+        match shorten_names(client, &token, model, &names).await {
+            Err(error) => result.error = Some(error),
+            Ok(short) => {
+                for (key, name) in unknown {
+                    let entry = ShortName {
+                        name: name.clone(),
+                        short: short.get(name).unwrap_or(name).clone(),
+                    };
+                    table.insert(key.clone(), entry.clone());
+                    result.added.insert(key.clone(), entry);
+                }
+                if let Some(bucket) = bucket {
+                    result.error = save_short_names(client, &token, bucket, &table).await.err();
+                }
+            }
+        }
+    }
+    result.used = used_short_names(products, &table);
+    result
+}
+
+/// 用 Vertex AI 的 Gemini 濃縮商品名稱，需要 Vertex AI 使用者角色。
+async fn shorten_names(
+    client: &Client,
+    token: &str,
+    model: &str,
+    names: &[String],
+) -> Result<BTreeMap<String, String>, String> {
+    let project = match env_text("GOOGLE_CLOUD_PROJECT") {
+        Some(project) => project,
+        None => gcp_metadata(client, "project/project-id")
+            .await?
+            .trim()
+            .to_string(),
+    };
+    let response = google_json(
+        client
+            .post(format!(
+                "https://aiplatform.googleapis.com/v1/projects/{}/locations/global/publishers/google/models/{}:generateContent",
+                encode_path_segment(&project),
+                encode_path_segment(model)
+            ))
+            .bearer_auth(token)
+            .json(&json!({
+                "systemInstruction": { "parts": [{ "text": SHORTEN_INSTRUCTION }] },
+                "contents": [{ "role": "user", "parts": [{ "text": json!(names).to_string() }] }],
+                "generationConfig": {
+                    "temperature": 0,
+                    "responseMimeType": "application/json",
+                    "responseSchema": { "type": "ARRAY", "items": { "type": "STRING" } },
+                },
+            })),
+        "Gemini 濃縮商品名稱",
+    )
+    .await?;
+    short_name_map(names, &response)
+}
+
 /// 以 MAIL_SENDER 本人授權的 OAuth 更新權杖（只有 gmail.send 權限）透過 Gmail API 寄信。
 struct Mailer {
     client: Client,
@@ -524,14 +830,12 @@ impl Mailer {
         let client_secret = required("MAIL_OAUTH_CLIENT_SECRET")?;
         let refresh_token = required("MAIL_OAUTH_REFRESH_TOKEN")?;
         let token = google_json(
-            client
-                .post("https://oauth2.googleapis.com/token")
-                .form(&[
-                    ("grant_type", "refresh_token"),
-                    ("client_id", &client_id),
-                    ("client_secret", &client_secret),
-                    ("refresh_token", &refresh_token),
-                ]),
+            client.post("https://oauth2.googleapis.com/token").form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("client_secret", &client_secret),
+                ("refresh_token", &refresh_token),
+            ]),
             "換取 Gmail 權杖（invalid_grant 表示更新權杖已失效，需重新授權）",
         )
         .await?;
@@ -581,6 +885,8 @@ struct Reminder {
     email: String,
     recipients: String,
     products: String,
+    /// 尚未填地址的群組；商品名稱濃縮後用來重組 products。
+    groups: Vec<Value>,
     result: &'static str,
     note: String,
 }
@@ -637,6 +943,7 @@ fn summary_html(
     undated: &[String],
     pending_orders: usize,
     truncated: bool,
+    short_names: &ShortNames,
 ) -> String {
     let count = |result: &str| reminders.iter().filter(|r| r.result == result).count();
     let mut html = format!(
@@ -659,6 +966,31 @@ fn summary_html(
         html.push_str(&format!(
             "<p style=\"color:#d93025;\"><strong>注意：以下訂單的下單時間無法解析，沒有判斷是否提醒：{}</strong></p>",
             escape_html(&undated.join("、"))
+        ));
+    }
+    if let Some(error) = &short_names.error {
+        html.push_str(&format!(
+            "<p style=\"color:#d93025;\"><strong>注意：商品名稱濃縮出了問題，這次部分或全部商品用的是原始名稱：{}</strong></p>",
+            escape_html(error)
+        ));
+    }
+    if !short_names.added.is_empty() {
+        html.push_str(&format!(
+            "<p>這次有新的商品名稱加進對照表，不滿意的話請修改 {SHORT_NAMES_OBJECT}：<br>{}</p>",
+            short_names
+                .added
+                .values()
+                .map(|ShortName { name, short }| if name == short {
+                    format!("{}（未更動）", escape_html(name))
+                } else {
+                    format!(
+                        "{} → <strong>{}</strong>",
+                        escape_html(name),
+                        escape_html(short)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("<br>")
         ));
     }
     if reminders.is_empty() {
@@ -863,7 +1195,8 @@ async fn run() -> Result<(), String> {
                                     .filter(|name| !name.is_empty())
                                     .collect::<Vec<_>>()
                                     .join("、"),
-                                products: product_text(&groups),
+                                products: product_text(&groups, &BTreeMap::new()),
+                                groups: groups.clone(),
                                 result,
                                 note: note.to_string(),
                             });
@@ -881,6 +1214,38 @@ async fn run() -> Result<(), String> {
                     "groups": groups,
                 }));
             }
+        }
+    }
+
+    // 只處理今天要提醒的訂單裡的商品名稱；預覽時也會做（也會寫對照表），方便先確認結果。
+    let gemini_model = env_text("GEMINI_MODEL");
+    let short_names_bucket = env_text("SHORT_NAMES_BUCKET");
+    let mut short_names = ShortNames::default();
+    if gemini_model.is_some() || short_names_bucket.is_some() {
+        // 同一個商品出現在多筆訂單時只算一次。
+        let products: Vec<(String, String)> = reminders
+            .iter()
+            .flat_map(|reminder| &reminder.groups)
+            .flat_map(|group| group["items"].as_array().into_iter().flatten())
+            .filter_map(|item| Some((product_key(item), item["name"].as_str()?.to_string())))
+            .filter(|(_, name)| !name.trim().is_empty())
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect();
+        if !products.is_empty() {
+            short_names = resolve_short_names(
+                &api.client,
+                gemini_model.as_deref(),
+                short_names_bucket.as_deref(),
+                &products,
+            )
+            .await;
+            if let Some(error) = &short_names.error {
+                eprintln!("商品名稱濃縮出了問題，查不到的用原名：{error}");
+            }
+        }
+        for reminder in &mut reminders {
+            reminder.products = product_text(&reminder.groups, &short_names.used);
         }
     }
 
@@ -929,6 +1294,7 @@ async fn run() -> Result<(), String> {
                     &undated,
                     orders.len(),
                     truncated,
+                    &short_names,
                 );
                 if let Err(error) = mailer.send(&mailer.summary_to, &subject, &html).await {
                     mail_error = Some(format!("統整信寄送失敗: {error}"));
@@ -954,7 +1320,14 @@ async fn run() -> Result<(), String> {
                 "deadlineDays": config.deadline_days,
                 "mailSubject": config.subject,
                 "mailBody": config.body,
+                "geminiModel": gemini_model,
+                "shortNamesBucket": short_names_bucket,
             },
+            // 這次信裡換掉名稱的商品（鍵是 productId）；newShortNames 是這次新加進對照表的，
+            // 出問題時原因在 shortNameError。
+            "shortNames": short_names_json(&short_names.used),
+            "newShortNames": short_names_json(&short_names.added),
+            "shortNameError": short_names.error,
             "undatedOrderIds": undated,
             "items": reminders.iter().map(Reminder::json).collect::<Vec<_>>(),
         },
@@ -1135,13 +1508,101 @@ mod tests {
     }
 
     #[test]
+    fn short_names_from_gemini_response() {
+        let names = vec![
+            "【限時免運】鳳梨酥禮盒 12入".to_string(),
+            "卡片".to_string(),
+            "茶葉".to_string(),
+        ];
+        let response = |answer: &str| {
+            json!({ "candidates": [{ "content": { "parts": [
+                { "thought": true, "text": "想一下" },
+                { "text": answer },
+            ]}}]})
+        };
+        // 沒變短（含變長、空白）的不採用，留原名。
+        assert_eq!(
+            short_name_map(&names, &response(r#"["鳳梨酥禮盒 12入", "精美卡片", " "]"#)),
+            Ok(BTreeMap::from([(
+                names[0].clone(),
+                "鳳梨酥禮盒 12入".to_string()
+            )]))
+        );
+        // 筆數對不上、不是 JSON、被過濾而沒有內容，都算失敗。
+        assert!(short_name_map(&names, &response(r#"["鳳梨酥禮盒"]"#)).is_err());
+        assert!(short_name_map(&names, &response("好的，以下是結果")).is_err());
+        let blocked = json!({ "candidates": [{ "finishReason": "SAFETY" }] });
+        let error = short_name_map(&names, &blocked).unwrap_err();
+        assert!(error.contains("SAFETY"), "{error}");
+    }
+
+    #[test]
+    fn short_name_table() {
+        let entry = |name: &str, short: &str| ShortName {
+            name: name.to_string(),
+            short: short.to_string(),
+        };
+        let table = parse_short_names(
+            r#"{
+                "101": { "name": "【限時免運】鳳梨酥禮盒", "short": "鳳梨酥禮盒" },
+                "102": { "name": "卡片", "short": "卡片" },
+                "103": { "name": "茶葉", "short": "高山烏龍茶葉" },
+                "104": { "short": " " },
+                "999": { "name": "沒出現的商品", "short": "x" }
+            }"#,
+        )
+        .unwrap();
+        // 101 在賣場改過名稱，仍沿用表裡的短名；和現在名稱相同（102）或空白（104）的不算換名稱；
+        // 手動改的（103）可以比原名長；表裡沒有的（105）用原名。
+        let products: Vec<(String, String)> = [
+            ("101", "★新春特賣★鳳梨酥禮盒"),
+            ("102", "卡片"),
+            ("103", "茶葉"),
+            ("104", "杯子"),
+            ("105", "新商品"),
+        ]
+        .map(|(key, name)| (key.to_string(), name.to_string()))
+        .into();
+        assert_eq!(
+            used_short_names(&products, &table),
+            BTreeMap::from([
+                (
+                    "101".to_string(),
+                    entry("★新春特賣★鳳梨酥禮盒", "鳳梨酥禮盒")
+                ),
+                ("103".to_string(), entry("茶葉", "高山烏龍茶葉")),
+            ])
+        );
+        // 有一筆格式不對就整份不用。
+        let error = parse_short_names(r#"{ "101": "鳳梨酥禮盒" }"#).unwrap_err();
+        assert!(error.contains("101"), "{error}");
+        assert!(parse_short_names("[]").is_err());
+
+        // LINE 的 productId 是數字；沒有編號時用名稱當鍵。
+        assert_eq!(
+            product_key(&json!({ "productId": 322533113, "name": "a" })),
+            "322533113"
+        );
+        assert_eq!(product_key(&json!({ "productId": null, "name": "a" })), "a");
+    }
+
+    #[test]
     fn product_text_and_html_escaping() {
         let groups = vec![json!({ "items": [
-            { "name": "禮盒 <A&B>", "spec": "紅 / L", "qty": 2 },
-            { "name": "卡片", "spec": "", "qty": 1 },
+            { "productId": 7, "name": "禮盒 <A&B>", "spec": "紅 / L", "qty": 2 },
+            { "productId": 8, "name": "卡片", "spec": "", "qty": 1 },
         ]})];
-        let products = product_text(&groups);
+        let products = product_text(&groups, &BTreeMap::new());
         assert_eq!(products, "禮盒 <A&B>（紅 / L） ×2、卡片");
+        // 有濃縮名稱的換掉，規格與數量照舊；沒有的用原名。
+        let short = BTreeMap::from([(
+            "7".to_string(),
+            ShortName {
+                name: "禮盒 <A&B>".to_string(),
+                short: "禮盒".to_string(),
+            },
+        )]);
+        assert_eq!(product_text(&groups, &short), "禮盒（紅 / L） ×2、卡片");
         let reminder = Reminder {
             order_id: "1".into(),
             ordered: NaiveDate::from_ymd_opt(2026, 11, 5).unwrap(),
@@ -1151,6 +1612,7 @@ mod tests {
             email: "a@b.com".into(),
             recipients: String::new(),
             products,
+            groups,
             result: "pending",
             note: String::new(),
         };
