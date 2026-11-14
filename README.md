@@ -48,16 +48,14 @@ cargo run --release -- --today=2026-11-13 --max=500
 
 ## 濃縮商品名稱（選用）
 
-商品名稱常帶有促銷字眼（例如「【限時免運】★熱銷破萬★」）。設定 `GEMINI_MODEL` 後，程式會把今天要提醒的訂單裡的商品名稱
-交給 Vertex AI 的 Gemini 去掉這些字眼，信裡的 `{products}` 和統整信都改用濃縮後的名稱。沒設定時行為和原本完全一樣。
+商品名稱常帶有促銷字眼（例如「【限時免運】★熱銷破萬★」）。設定 `GEMINI_MODEL` 後，程式會把今天要提醒的訂單裡的商品名稱交給 Vertex AI 的 Gemini 去掉這些字眼，信裡的 `{products}` 和統整信都改用濃縮後的名稱。沒設定時行為和原本完全一樣。
 
 - 只送商品名稱，不送姓名、email、訂單編號。
 - 任何失敗（權限、逾時、回傳筆數對不上）都不影響寄信：問不到的商品用原名，提醒信照寄；統整信會用紅字註明，輸出的 `reminders.shortNameError` 有原因。
 - 只濃縮商品名稱；規格（顏色、尺寸等）照原樣接在名稱後面。
 - 沒有變短的結果不採用。輸出的 `reminders.shortNames` 列出這次信裡換掉名稱的商品（鍵是 `productId`，`name` 是原名、`short` 是信裡用的名稱）。
 - 預覽（沒帶 `--send`）時也會濃縮，正式啟用前請先預覽幾次確認結果。
-  那天沒有要提醒的訂單時就沒有商品可濃縮，`shortNames`、`newShortNames`、`shortNameError` 都會是空的，
-  這不代表設定正確；請加 `--today=YYYY-MM-DD` 指定一個有提醒的日期來試。
+  那天沒有要提醒的訂單時就沒有商品可濃縮，`shortNames`、`newShortNames`、`shortNameError` 都會是空的，這不代表設定正確；請加 `--today=YYYY-MM-DD` 指定一個有提醒的日期來試。
 - 模型的輸出不保證每次相同，同一個商品在不同天的信裡名稱可能略有差異；要固定下來請搭配下方的對照表。
 
 啟用步驟（只需一次）：
@@ -69,9 +67,7 @@ gcloud projects add-iam-policy-binding 你的專案ID `
   --role="roles/aiplatform.user"
 ```
 
-再到 Cloud Run 主控台替 Job 新增環境變數 `GEMINI_MODEL`，值填 Vertex AI 上的型號 ID，例如 `gemini-3.1-flash-lite`。
-型號會汰換，下架後濃縮會失敗（信仍以原名寄出），到時換成新的型號 ID 即可；拿掉這個變數就停用。
-要啟用的是 Vertex AI API（`aiplatform.googleapis.com`），不是 Discovery Engine API。
+再到 Cloud Run 主控台替 Job 新增環境變數 `GEMINI_MODEL`，值填 Vertex AI 上的型號 ID，例如 `gemini-3.1-flash-lite`。型號會汰換，下架後濃縮會失敗（信仍以原名寄出），到時換成新的型號 ID 即可；拿掉這個變數就停用。要啟用的是 Vertex AI API（`aiplatform.googleapis.com`），不是 Discovery Engine API。
 
 ### 對照表（選用）
 
@@ -88,13 +84,11 @@ gcloud projects add-iam-policy-binding 你的專案ID `
 - 表裡已經有的商品直接用 `short`，不再問 Gemini，所以同一個商品每次的名稱都一樣。
 - 因為是用商品編號對照，**在賣場改了商品名稱（例如換一批促銷字眼）信裡的名稱也不會變**。
 - 表裡沒有的才問 Gemini，結果寫回表裡；沒變短的 `short` 會和 `name` 一樣，之後不會重問。
-- 統整信和輸出的 `reminders.newShortNames` 會列出這次新加的項目。不滿意就到 Cloud Storage 主控台下載
-  `short-names.json`、改掉 `short` 再上傳覆蓋；手動改的名稱不受「必須比原名短」的限制。想讓某個商品重新濃縮，把那一筆刪掉即可。
+- 統整信和輸出的 `reminders.newShortNames` 會列出這次新加的項目。不滿意就到 Cloud Storage 主控台下載`short-names.json`、改掉 `short` 再上傳覆蓋；手動改的名稱不受「必須比原名短」的限制。想讓某個商品重新濃縮，把那一筆刪掉即可。
 - 預覽（沒帶 `--send`）時也會寫入對照表。
 - 只設 `SHORT_NAMES_BUCKET`、不設 `GEMINI_MODEL` 也可以：這時只查表，表完全由你手動維護。
 - 表讀不到或格式壞掉時，這次全部用原名而且不會寫回，既有的表不會被蓋掉。
-- Job 執行期間（讀表之後、寫回之前）表被改動時，Job 不會覆蓋你的修改：這次新加的項目不寫回，
-  原因記在 `reminders.shortNameError` 與統整信，信照寄，下次執行會重新濃縮那些商品。
+- Job 執行期間（讀表之後、寫回之前）表被改動時，Job 不會覆蓋你的修改：這次新加的項目不寫回，原因記在 `reminders.shortNameError` 與統整信，信照寄，下次執行會重新濃縮那些商品。
 
 ```powershell
 gcloud storage buckets create gs://你的bucket名稱 --location=asia-east1 --uniform-bucket-level-access
@@ -107,9 +101,7 @@ gcloud storage buckets add-iam-policy-binding gs://你的bucket名稱 `
 
 ## 不改程式就能調整的設定
 
-天數和信件內容都是環境變數，改完下次執行就生效，不用重新部署：
-Cloud Run 主控台 → Jobs → `line-gift-pending-address` →「編輯」→「變數與密鑰」。
-push 觸發的自動部署不會動到環境變數，不會蓋掉這些值。
+天數和信件內容都是環境變數，改完下次執行就生效，不用重新部署：Cloud Run 主控台 → Jobs → `line-gift-pending-address` →「編輯」→「變數與密鑰」。push 觸發的自動部署不會動到環境變數，不會蓋掉這些值。
 
 | 環境變數 | 預設 | 說明 |
 | --- | --- | --- |
@@ -130,8 +122,7 @@ push 觸發的自動部署不會動到環境變數，不會蓋掉這些值。
 | `{recipients}` | 收禮人 | |
 | `{order_id}` | 訂單編號 | |
 
-內文裡的代碼可以放在文字或**有引號**（單、雙引號皆可）的屬性值內。換進去的內容只做 HTML 跳脫，
-保證不會跳出文字或引號；不要放在沒有引號的屬性，或 `href`、`style`、`<script>` 這類需要網址／CSS／程式語意的位置。
+內文裡的代碼可以放在文字或**有引號**（單、雙引號皆可）的屬性值內。換進去的內容只做 HTML 跳脫，保證不會跳出文字或引號；不要放在沒有引號的屬性，或 `href`、`style`、`<script>` 這類需要網址／CSS／程式語意的位置。
 
 預設值：
 
@@ -147,13 +138,10 @@ MAIL_BODY=您贈送給朋友的 <strong>{products}</strong>，<br><span style="c
 
 ## 寄信的運作方式
 
-用個人 Gmail 帳號（`MAIL_SENDER`）寄信。個人帳號沒有「全網域委派」可用，所以改由帳號本人做一次 OAuth 授權，
-拿到只有 `gmail.send`（只能寄信、不能讀信）權限的更新權杖，存在 Secret Manager；
-Job 每次執行時用它向 Google 換一張短效權杖，再呼叫 Gmail API。
+用個人 Gmail 帳號（`MAIL_SENDER`）寄信。個人帳號沒有「全網域委派」可用，所以改由帳號本人做一次 OAuth 授權，拿到只有 `gmail.send`（只能寄信、不能讀信）權限的更新權杖，存在 Secret Manager；Job 每次執行時用它向 Google 換一張短效權杖，再呼叫 Gmail API。
 
 - 個人 Gmail 每天約可寄給 500 位收件人，超過會被暫時停寄。
-- **更改 Google 帳號密碼會讓更新權杖失效**（Job 會以 `invalid_grant` 失敗），需重做下方第 3、4 步。
-  在 [Google 帳戶的第三方存取權](https://myaccount.google.com/connections)移除這個應用程式、或權杖連續 6 個月沒用到，也會失效。
+- **更改 Google 帳號密碼會讓更新權杖失效**（Job 會以 `invalid_grant` 失敗），需重做下方第 3、4 步。在 [Google 帳戶的第三方存取權](https://myaccount.google.com/connections)移除這個應用程式、或權杖連續 6 個月沒用到，也會失效。
 
 ### 一次性設定
 
@@ -182,13 +170,13 @@ GCP 主控台（專案可以屬於任何帳號，不必是寄信的那個 Gmail�
 3. 登入**要用來寄信的那個 Gmail 帳號**。出現未驗證警告時按「進階」→「前往…（不安全）」，再按允許。
 4. Step 2 按「Exchange authorization code for tokens」，複製 **Refresh token**。
 
-#### 4. 把密鑰放進 Secret Manager、建立 Job 的服務帳號
+#### 4. 把密鑰放進 Secret Manager、建立 Job 的服務帳戶
 
 ```powershell
 $project = "你的專案ID"
 $sa = "line-gift-pending-address-job@$project.iam.gserviceaccount.com"
 
-# Job 專用的服務帳號
+# Job 專用的服務帳戶
 gcloud iam service-accounts create line-gift-pending-address-job --display-name="LINE gift pending address job"
 
 # 兩個寄信用的密鑰（名稱要和 cloudbuild.yaml 一致）
@@ -217,7 +205,7 @@ Remove-Item "$env:TEMP\s.txt"
 
 Job 由 Cloud Build 建立與更新：push 到 `main` 時，觸發條件依 `cloudbuild.yaml` 建置映像檔、推到 Artifact Registry，再執行 `gcloud run jobs deploy`。Job 不存在就建立，存在就更新，所以不需要手動做第一次部署。
 
-- Job 的服務帳戶、secret、`--send`、重試次數、逾時都寫在 `cloudbuild.yaml`，要改就改檔案後 push。
+- Job 的服務帳戶、密鑰、`--send`、重試次數、逾時都寫在 `cloudbuild.yaml`，要改就改檔案後 push。
 - 環境變數不在 `cloudbuild.yaml` 裡，在 Cloud Run 主控台設定，每次部署都會保留。
 - 部署只建立或更新 Job、不執行，所以部署本身不會寄信。
 - `cloudbuild.yaml` 裡的 `--max-retries=0` 請保留：重試會讓已經寄出的信再寄一次。
@@ -250,7 +238,7 @@ Remove-Item "$env:TEMP\lg-token.txt"
    | Artifact Registry 存放區清單勾選 `line-gift-pending-address` → 右側面板「權限」 | Artifact Registry 寫入者 | 推映像檔 |
    | 「IAM」頁面（專案層級） | Cloud Run 開發人員 | 建立與更新 Job |
    | 服務帳戶 `line-gift-pending-address-job` →「具有存取權的主體」 | 服務帳戶使用者 | 指定 Job 的執行身分 |
-   | 「IAM」頁面（專案層級） | 記錄寫入者 | 寫建置紀錄 |
+   | 「IAM」頁面（專案層級） | 記錄寫入者 | 寫建置記錄 |
 
 5. **連結 GitHub repo**：「Cloud Build」→「觸發條件」→「連結存放區」，選 GitHub，依畫面安裝 Cloud Build 的 GitHub App 並選這個 repo。repo 在組織底下時，安裝 App 需要組織擁有者核准。
 6. **建立觸發條件**：「建立觸發條件」，設定如下：
@@ -299,7 +287,7 @@ gcloud run jobs execute line-gift-pending-address --region asia-east1 --wait
 gcloud run jobs execute line-gift-pending-address --region asia-east1 --args="--max=200" --wait
 ```
 
-### 每日 08:00 排程
+### 5. 每日 08:00 排程
 
 ```powershell
 gcloud services enable cloudscheduler.googleapis.com
@@ -329,7 +317,10 @@ gcloud scheduler jobs create http line-gift-pending-address-daily `
 | `failed` | 寄送失敗，`note` 有原因 |
 | `skipped` | 沒有 email 或格式不正確，未寄 |
 
-有任何一封寄送失敗（含統整信）時，Job 會以失敗狀態結束，但報表仍會先印出。
-商品名稱濃縮失敗不算寄送失敗：信以原名寄出，Job 仍以成功狀態結束。
+有任何一封寄送失敗（含統整信）時，Job 會以失敗狀態結束，但報表仍會先印出。商品名稱濃縮失敗不算寄送失敗：信以原名寄出，Job 仍以成功狀態結束。
 
 輸出與統整信都含收禮人姓名與送禮人 email，請留意 log 的存取權限與保存期限。
+
+## 授權條款
+
+本專案以 MIT 授權條款釋出，詳見 [LICENSE](LICENSE)。
