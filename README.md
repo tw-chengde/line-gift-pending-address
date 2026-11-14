@@ -52,9 +52,12 @@ cargo run --release -- --today=2026-11-13 --max=500
 交給 Vertex AI 的 Gemini 去掉這些字眼，信裡的 `{products}` 和統整信都改用濃縮後的名稱。沒設定時行為和原本完全一樣。
 
 - 只送商品名稱，不送姓名、email、訂單編號。
-- 任何失敗（權限、逾時、回傳筆數對不上）都退回原名，提醒信照寄；統整信會用紅字註明，輸出的 `reminders.shortNameError` 有原因。
+- 任何失敗（權限、逾時、回傳筆數對不上）都不影響寄信：問不到的商品用原名，提醒信照寄；統整信會用紅字註明，輸出的 `reminders.shortNameError` 有原因。
+- 只濃縮商品名稱；規格（顏色、尺寸等）照原樣接在名稱後面。
 - 沒有變短的結果不採用。輸出的 `reminders.shortNames` 列出這次信裡換掉名稱的商品（鍵是 `productId`，`name` 是原名、`short` 是信裡用的名稱）。
 - 預覽（沒帶 `--send`）時也會濃縮，正式啟用前請先預覽幾次確認結果。
+  那天沒有要提醒的訂單時就沒有商品可濃縮，`shortNames`、`newShortNames`、`shortNameError` 都會是空的，
+  這不代表設定正確；請加 `--today=YYYY-MM-DD` 指定一個有提醒的日期來試。
 - 模型的輸出不保證每次相同，同一個商品在不同天的信裡名稱可能略有差異；要固定下來請搭配下方的對照表。
 
 啟用步驟（只需一次）：
@@ -117,7 +120,7 @@ push 觸發的自動部署不會動到環境變數，不會蓋掉這些值。
 
 | 代碼 | 內容 | 範例 |
 | --- | --- | --- |
-| `{products}` | 尚未填地址的商品（有設 `GEMINI_MODEL` 時是濃縮後的名稱） | 禮盒（紅 / L） ×2、卡片 |
+| `{products}` | 尚未填地址的商品（有設 `GEMINI_MODEL` 或 `SHORT_NAMES_BUCKET` 時是濃縮後的名稱） | 禮盒（紅 / L） ×2、卡片 |
 | `{deadline}` | 最後填寫地址日期 | 11/14（六） |
 | `{ordered}` | 下單日 | 11/5（四） |
 | `{days}` | 今天是下單後第幾天 | 8 |
@@ -270,6 +273,8 @@ Remove-Item "$env:TEMP\lg-token.txt"
 | `MAIL_FROM_NAME` | 選填 |
 | `MAIL_REPLY_TO` | 選填 |
 | `MAIL_SUMMARY_TO` | 選填 |
+| `GEMINI_MODEL` | 選填。要先完成「濃縮商品名稱」的啟用步驟 |
+| `SHORT_NAMES_BUCKET` | 選填。要先完成「對照表」的啟用步驟 |
 
 `MAIL_OAUTH_CLIENT_SECRET` 和 `MAIL_OAUTH_REFRESH_TOKEN` 由 `cloudbuild.yaml` 從 Secret Manager 帶入，不用在這裡填。
 
