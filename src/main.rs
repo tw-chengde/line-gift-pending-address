@@ -1189,6 +1189,7 @@ fn summary_html(
         }
         html.push_str("</tr>");
         for reminder in reminders {
+            html.push_str("<tr>");
             let result = match reminder.result {
                 "sent" => "已寄出".to_string(),
                 "failed" => format!(
@@ -2238,6 +2239,33 @@ mod tests {
         assert!(reminder
             .html(&config)
             .contains("<b>11/5（四）</b> 下單，訂單 1</div>"));
+
+        // 統整信每筆訂單都要有完整的 <tr>…</tr>，少了開頭的 <tr> 時 Gmail 會把所有訂單擠成一列。
+        let second = Reminder {
+            order_id: "2".into(),
+            ordered: reminder.ordered,
+            days: reminder.days,
+            deadline: reminder.deadline,
+            sender_name: String::new(),
+            email: "c@d.com".into(),
+            recipients: String::new(),
+            products: String::new(),
+            groups: Vec::new(),
+            result: "sent",
+            note: String::new(),
+        };
+        let summary = summary_html(
+            &config,
+            NaiveDate::from_ymd_opt(2026, 11, 13).unwrap(),
+            &[reminder, second],
+            &[],
+            2,
+            false,
+            &ShortNames::default(),
+        );
+        assert_eq!(summary.matches("<tr>").count(), 3);
+        assert_eq!(summary.matches("</tr>").count(), 3);
+        assert!(!summary.contains("</tr><td"));
     }
 
     #[test]
